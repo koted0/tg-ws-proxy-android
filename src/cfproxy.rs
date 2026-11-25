@@ -1,13 +1,13 @@
 use crate::config::*;
-use crate::ws::{is_http_status_error, ws_connect_once, RawWebSocket, WsError};
-use crate::{ldebug, lerror, linfo, lwarn};
+use crate::ws::{is_http_status_error, RawWebSocket, WsError};
+use crate::{ldebug, linfo, lwarn};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
 
 use once_cell::sync::Lazy;
-static CFPROXY_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(CFPROXY_GLOBAL_PARALLEL));
 
 // ---------------------------------------------------------------------------
 // Domain decoding
@@ -197,10 +197,6 @@ pub fn cfproxy_429_cooldown_remaining(domain: &str) -> Duration {
     until - now
 }
 
-pub async fn acquire_cfproxy_attempt_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
-    CFPROXY_SEM.acquire().await.ok()
-}
-
 // ---------------------------------------------------------------------------
 // Cache files
 // ---------------------------------------------------------------------------
@@ -279,10 +275,14 @@ pub fn init_cfproxy_domains() {
 
     let mut cfg = CFPROXY.write();
     if !cfg.user_domain.is_empty() {
-        let ud = cfg.user_domain.clone();
-        cfg.domains = vec![ud.clone()];
-        crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
-        return;
+        // Пользовательских доменов может быть несколько (через , ; или пробел),
+        // как --cfproxy-domain (repeatable) в оригинале.
+        let user = normalize_domain_pool(&coerce_domain_list_str(&cfg.user_domain));
+        if !user.is_empty() {
+            cfg.domains = user;
+            crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
+            return;
+        }
     }
 
     if !cached.is_empty() {
@@ -297,28 +297,35 @@ pub fn init_cfproxy_domains() {
     }
 }
 
-pub fn start_cfproxy_refresh() {
+pub fn start_cfproxy_refresh(cancel: CancellationToken) {
     // Порт proxy/config.py::start_cfproxy_domain_refresh: сначала пробуем
     // обновить сразу (до 3 попыток), затем раз в час фоновым таском.
     // На мобиле уважаем свежесть дискового кеша для первой попытки.
+    // Таск привязан к жизни прокси: StopProxy его отменяет.
+    if !CFPROXY.read().user_domain.trim().is_empty() {
+        return;
+    }
     if !should_refresh_cfproxy_domains() {
         ldebug!(" CF: кеш свежий, откладываю обновление списка на час");
     }
     tokio::spawn(async move {
-        if should_refresh_cfproxy_domains() {
-            for _ in 0..3 {
-                if try_refresh_cfproxy_domains().await {
-                    break;
+        let work = async {
+            if should_refresh_cfproxy_domains() {
+                for _ in 0..3 {
+                    if try_refresh_cfproxy_domains().await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(10)).await;
             }
-            if CFPROXY.read().domains.is_empty() {
-                ldebug!(" CF: обновить список доменов не удалось, остаюсь на кеше/встроенном списке");
+            loop {
+                tokio::time::sleep(CFPROXY_REFRESH_INTERVAL).await;
+                try_refresh_cfproxy_domains().await;
             }
-        }
-        loop {
-            tokio::time::sleep(CFPROXY_REFRESH_INTERVAL).await;
-            try_refresh_cfproxy_domains().await;
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = work => {}
         }
     });
 }
@@ -561,53 +568,155 @@ pub async fn resolve_doh(domain: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// cfConnectDomain
+// connect_cf_domains — порт proxy/cf_websocket.py (Flowseal v1.12):
+// перебор CF-доменов с короткими таймаутами (3,3,5,5,10с), чередование
+// TLS(443)/HTTP(80) после таймаутов и 30-секундный cooldown пары
+// (домен, tls). Предпочитается тот режим, который чаще срабатывал.
+// Поверх оригинала — 429-cooldown домена (мобильное улучшение форка).
 // ---------------------------------------------------------------------------
 
-fn new_timed_attempt_timeout(base: Duration, phase: Duration) -> Duration {
-    let mut eff = base;
-    if eff <= Duration::ZERO {
-        eff = Duration::from_secs(5);
-    }
-    if eff > phase {
-        eff = phase;
-    }
-    eff
+#[derive(Default)]
+struct CfConnState {
+    timeout_until: HashMap<(String, bool), f64>,
+    tls: u64,
+    no_tls: u64,
 }
 
-pub async fn cf_connect_domain(
-    domain: &str,
-    path: &str,
-    timeout: f64,
-) -> (Option<RawWebSocket>, String, Option<WsError>) {
-    let path = if path.is_empty() { "/apiws" } else { path };
+static CF_CONN: Lazy<parking_lot::Mutex<CfConnState>> =
+    Lazy::new(|| parking_lot::Mutex::new(CfConnState::default()));
 
-    let attempt_timeout = crate::ws::ws_connect_timeout(timeout);
-    let mut phase_timeout = attempt_timeout;
-    if phase_timeout > CFPROXY_DIAL_PHASE_TIMEOUT {
-        phase_timeout = CFPROXY_DIAL_PHASE_TIMEOUT;
-    }
+pub fn reset_cf_timeouts() {
+    *CF_CONN.lock() = CfConnState::default();
+}
 
-    let host_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-    match ws_connect_once(domain, domain, path, host_timeout).await {
-        Ok(ws) => return (Some(ws), String::new(), None),
-        Err(host_err) => {
-            if is_http_status_error(&host_err, 429) {
-                return (None, String::new(), Some(host_err));
-            }
-            let resolved_ip = resolve_doh(domain).await.unwrap_or_default();
-            if resolved_ip.is_empty() {
-                ldebug!(" CF DNS {} -> no result", domain);
-                return (None, String::new(), Some(host_err));
-            }
-            ldebug!(" CF DNS {} -> {}", domain, resolved_ip);
-            let ip_timeout = new_timed_attempt_timeout(phase_timeout, phase_timeout);
-            match ws_connect_once(&resolved_ip, domain, path, ip_timeout).await {
-                Ok(ws) => (Some(ws), resolved_ip, None),
-                Err(e) => (None, resolved_ip, Some(e)),
+pub fn cf_prefers_tls() -> bool {
+    let st = CF_CONN.lock();
+    st.tls >= st.no_tls
+}
+
+/// Возвращает прежний cooldown, если попытку, занявшую слот повтора
+/// (INFINITY), отменили посреди подключения (аналог finally в оригинале).
+struct RetryClaim {
+    key: (String, bool),
+    retry_at: Option<f64>,
+}
+
+impl Drop for RetryClaim {
+    fn drop(&mut self) {
+        if let Some(retry_at) = self.retry_at {
+            let mut st = CF_CONN.lock();
+            if st.timeout_until.get(&self.key) == Some(&f64::INFINITY) {
+                st.timeout_until.insert(self.key.clone(), retry_at);
             }
         }
     }
+}
+
+/// candidates: (имя для балансера, хост для подключения).
+pub async fn connect_cf_domains(
+    candidates: Vec<(String, String)>,
+    label: &str,
+    secure: bool,
+    path: &str,
+    timeout: f64,
+) -> Option<(RawWebSocket, String)> {
+    let mut domains = candidates;
+    let retry_single_domain = secure && domains.len() == 1;
+    if retry_single_domain {
+        let first = domains[0].clone();
+        domains.push(first);
+    }
+
+    let mut timeouts = 0usize;
+    let tls_first = cf_prefers_tls();
+
+    for (index, (name, host)) in domains.iter().enumerate() {
+        let mut use_tls = secure && (tls_first != (timeouts % 2 == 1));
+        if retry_single_domain && index == 1 && timeouts == 0 {
+            // Первая попытка была пропущена из-за cooldown — пробуем другой режим.
+            use_tls = !tls_first;
+        }
+
+        if cfproxy_429_cooldown_remaining(name) > Duration::ZERO {
+            ldebug!("[{}] CF skip {}: 429 cooldown", label, host);
+            continue;
+        }
+
+        let key = (name.clone(), use_tls);
+        let retry_at = {
+            let mut st = CF_CONN.lock();
+            let retry_at = st.timeout_until.get(&key).copied();
+            if let Some(until) = retry_at {
+                if now_monotonic() < until {
+                    continue;
+                }
+                // Занимаем слот повторной попытки, чтобы параллельные клиенты
+                // не ломились в тот же домен одновременно.
+                st.timeout_until.insert(key.clone(), f64::INFINITY);
+            }
+            retry_at
+        };
+        let _claim = RetryClaim {
+            key: key.clone(),
+            retry_at,
+        };
+
+        let attempt_timeout = timeout.min(CF_CONNECT_TIMEOUTS[timeouts]);
+        let result = tokio::time::timeout(
+            Duration::from_secs_f64(attempt_timeout),
+            crate::ws::ws_connect_full_opts(host, host, path, attempt_timeout, None, Some(use_tls)),
+        )
+        .await
+        .unwrap_or(Err(WsError::Timeout));
+
+        match result {
+            Err(e) if e.is_timeout() => {
+                let now = now_monotonic();
+                let mut st = CF_CONN.lock();
+                if retry_at.is_some() || !st.timeout_until.contains_key(&key) {
+                    st.timeout_until.retain(|_, until| *until + CF_TIMEOUT_COOLDOWN > now);
+                    st.timeout_until.insert(key.clone(), now + CF_TIMEOUT_COOLDOWN);
+                    drop(st);
+                    lwarn!(
+                        "[{}] CF WebSocket timed out (host={} tls={}); retry in {:.0}s",
+                        label, host, use_tls, CF_TIMEOUT_COOLDOWN
+                    );
+                }
+                timeouts += 1;
+                if timeouts >= CF_CONNECT_TIMEOUTS.len() {
+                    break;
+                }
+                continue;
+            }
+            Err(e) => {
+                CF_CONN.lock().timeout_until.remove(&key);
+                if is_http_status_error(&e, 429) {
+                    mark_cfproxy_429_cooldown(name, &e);
+                }
+                log_cf_conn_error(
+                    &format!("[{}] CF WebSocket failed (host={} tls={}): {}", label, host, use_tls, e.compact()),
+                    &e,
+                );
+                if retry_single_domain {
+                    break;
+                }
+            }
+            Ok(ws) => {
+                {
+                    let mut st = CF_CONN.lock();
+                    st.timeout_until.remove(&key);
+                    if use_tls {
+                        st.tls += 1;
+                    } else {
+                        st.no_tls += 1;
+                    }
+                }
+                clear_cfproxy_429_cooldown(name);
+                return Some((ws, name.clone()));
+            }
+        }
+    }
+    None
 }
 
 pub fn log_cf_conn_error(msg: &str, err: &WsError) {
@@ -616,11 +725,8 @@ pub fn log_cf_conn_error(msg: &str, err: &WsError) {
             return;
         }
     }
-    if is_http_status_error(err, 429) {
-        lwarn!("{}", msg);
-    } else {
-        lerror!("{}", msg);
-    }
+    // Оригинал пишет сбои CF-подключений как warning.
+    lwarn!("{}", msg);
 }
 
 // активный домен set/save

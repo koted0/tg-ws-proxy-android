@@ -2,7 +2,8 @@ use crate::config::ZERO64;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
-type Aes256Ctr = ctr::Ctr64BE<aes::Aes256>;
+// CTR со 128-битным счётчиком — как modes.CTR в оригинале (cryptography).
+type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
 
 // ---------------------------------------------------------------------------
 // TrackedStream — эмулирует Go cipher.Stream с поддержкой Clone() через

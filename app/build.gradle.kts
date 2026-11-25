@@ -12,8 +12,14 @@ android {
     defaultConfig {
         applicationId = "com.amurcanov.tgwsproxy"
         targetSdk = 35
-        versionCode = 123
-        versionName = "1.2.3"
+        versionCode = 130
+        versionName = "1.3.0"
+
+        // Откуда приложение проверяет обновления и куда ведут ссылки
+        // "Репозиторий"/"Issues" в разделе "Информация".
+        buildConfigField("String", "GITHUB_REPO", "\"koted0/tg-ws-proxy-android\"")
+        // Версия Flowseal/tg-ws-proxy, с которой синхронизировано Rust-ядро.
+        buildConfigField("String", "UPSTREAM_VERSION", "\"1.12.0\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

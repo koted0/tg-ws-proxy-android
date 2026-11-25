@@ -105,9 +105,10 @@ pub unsafe extern "C" fn StartProxy(
     let cancel_root = cancel_tasks.clone();
 
     let handle = rt.spawn(async move {
-        // Предварительный bind для сигнала готовности
+        // Предварительный bind для сигнала готовности (кортеж — чтобы IPv6
+        // адрес без скобок тоже работал).
         let addr = format!("{}:{}", host_task, go_port);
-        match tokio::net::TcpListener::bind(&addr).await {
+        match tokio::net::TcpListener::bind((host_task.as_str(), go_port)).await {
             Ok(listener) => {
                 let _ = tx.send(Ok(()));
                 if let Err(e) =
@@ -117,6 +118,7 @@ pub unsafe extern "C" fn StartProxy(
                 }
             }
             Err(e) => {
+                lerror!("listen on {}: {}", addr, e);
                 let _ = tx.send(Err(format!("listen on {}: {}", addr, e)));
             }
         }
@@ -162,20 +164,16 @@ pub extern "C" fn StopProxy() -> c_int {
     let pools = state.pools.clone();
     let handle = state.handle;
     rt.block_on(async move {
-        linfo!("StopProxy: waiting for proxy tasks to finish (max 2s)");
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
-        linfo!("StopProxy: closing pool connections");
-        pools.close_all().await;
-        pools.reset().await;
-        linfo!("StopProxy: done");
+        pools.reset();
+        // Даём закрыться WS из пула до возможного повторного StartProxy.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     });
 
     STATS.reset();
-    WS_BLACKLIST.write().clear();
-    DC_FAIL_UNTIL.write().clear();
-    IP_FAIL_UNTIL.write().clear();
     cfproxy::clear_cfproxy_429_cooldowns();
-    proxy::set_ws_pool_fronting_first(true);
+    cfproxy::reset_cf_timeouts();
+    proxy::reset_tcp_backoff();
 
     linfo!("StopProxy: exit");
     0

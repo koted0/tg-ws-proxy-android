@@ -1,0 +1,168 @@
+name: Android Build & Release
+
+# Собирает нативный Rust-движок (cargo-ndk) и APK (Gradle) на Linux-раннере.
+#
+# Подпись: без секретов release-сборка подписывается debug-ключом раннера,
+# который каждый раз новый — такие APK нельзя ставить поверх друг друга.
+# Для обновляемых сборок задайте секреты репозитория:
+#   ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD,
+#   ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD.
+#
+# Релиз: push тега вида v1.3.0 или ручной запуск с make_release=true.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      make_release:
+        description: 'Create GitHub Release?'
+        type: boolean
+        required: true
+        default: false
+      version:
+        description: 'Release tag (e.g. v1.3.0)'
+        required: false
+        default: 'v1.3.0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: 27.0.12077973
+  JAVA_VERSION: '17'
+
+jobs:
+  rust:
+    name: Rust tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo test
+        run: cargo test --lib --locked
+
+  build:
+    name: Native libs + APK
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install platform, build-tools and NDK
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build native libs (arm64-v8a, armeabi-v7a)
+        run: |
+          set -euo pipefail
+          cargo ndk -t arm64-v8a --platform 24 -o app/src/main/jniLibs build --release --locked
+          cargo ndk -t armeabi-v7a --platform 21 -o app/src/main/jniLibs build --release --locked
+          ls -la app/src/main/jniLibs/arm64-v8a app/src/main/jniLibs/armeabi-v7a
+
+      - name: Restore release keystore (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          rm -f local.properties
+          if [ -z "${KEYSTORE_B64}" ]; then
+            echo "No keystore secret: release APKs will use debug signing"
+            exit 0
+          fi
+          echo "${KEYSTORE_B64}" | base64 -d > release.keystore
+          {
+            echo "KEYSTORE_FILE=../release.keystore"
+            echo "KEYSTORE_PASSWORD=${KEYSTORE_PASS}"
+            echo "KEY_ALIAS=${KEY_ALIAS}"
+            echo "KEY_PASSWORD=${KEY_PASS}"
+          } > local.properties
+
+      - name: Build release APKs
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APKs
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/.*versionName *= *"\(.*\)".*/\1/p' app/build.gradle.kts | head -1)
+          mkdir -p dist
+          for flavor in arm32 arm64 universal; do
+            src=$(ls app/build/outputs/apk/${flavor}/release/*.apk | head -1)
+            cp "$src" "dist/tg-ws-proxy-android-v${version}-${flavor}.apk"
+          done
+          ls -la dist
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: tg-ws-proxy-android-apks
+          path: dist/*.apk
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: >-
+      ${{ startsWith(github.ref, 'refs/tags/v') ||
+          (github.event_name == 'workflow_dispatch' &&
+           github.event.inputs.make_release == 'true') }}
+    permissions:
+      contents: write
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-ws-proxy-android-apks
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}
+          name: TG WS Proxy Android ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version }}
+          files: dist/*.apk
+          draft: false
+          prerelease: false

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::time::Instant;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -36,7 +37,7 @@ const MAX_FRAME_PAYLOAD: u64 = 16 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct NoVerify;
+pub(crate) struct NoVerify;
 
 impl ServerCertVerifier for NoVerify {
     fn verify_server_cert(
@@ -128,6 +129,15 @@ pub enum WsError {
 }
 
 impl WsError {
+    /// asyncio.TimeoutError / TimeoutError в оригинале.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            WsError::Timeout => true,
+            WsError::Io(e) => e.kind() == std::io::ErrorKind::TimedOut,
+            _ => false,
+        }
+    }
+
     pub fn compact(&self) -> String {
         match self {
             WsError::Canceled => "canceled".to_string(),
@@ -193,6 +203,10 @@ pub struct RawWebSocket {
     frag: tokio::sync::Mutex<Vec<u8>>,
     pub closed: AtomicBool,
     pub secure: bool,
+    // dup() исходного TCP-сокета: только для неблокирующего MSG_PEEK, чтобы
+    // увидеть EOF/неожиданные данные на простаивающем соединении из пула
+    // (аналог reader.at_eof() / reader.exception() в pool._is_stale).
+    probe: Option<socket2::Socket>,
 }
 
 impl RawWebSocket {
@@ -203,6 +217,38 @@ impl RawWebSocket {
     /// Совместимость: закрыт ли транспорт (аналог writer.transport.is_closing()).
     pub fn transport_closing(&self) -> bool {
         self.is_closed()
+    }
+
+    /// true, если простаивающее соединение больше нельзя отдавать клиенту:
+    /// пир прислал FIN, ошибку или что-то (close/ping) пока WS лежал в пуле.
+    pub fn peer_gone(&self) -> bool {
+        let sock = match self.probe.as_ref() {
+            Some(s) => s,
+            None => return false,
+        };
+        let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 1];
+        match sock.peek(&mut buf) {
+            Ok(_) => true,
+            Err(e) => !matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ),
+        }
+    }
+
+    /// Пул: соединение закрыто или пир уже отвалился.
+    pub fn is_stale(&self) -> bool {
+        self.is_closed() || self.peer_gone()
+    }
+
+    /// RawWebSocket.send_init: relay_init с жёстким таймаутом 10с;
+    /// при ошибке соединение помечается закрытым.
+    pub async fn send_init(&self, data: &[u8]) -> Result<(), WsError> {
+        if self.is_closed() {
+            return Err(WsError::Other("WebSocket closed".to_string()));
+        }
+        let frame = build_frame(OP_BINARY, data, true);
+        self.write_frame(&frame, WS_INIT_SEND_TIMEOUT).await
     }
 
     pub async fn send(&self, data: &[u8]) -> Result<(), WsError> {
@@ -588,6 +634,7 @@ fn set_sock_opts(stream: &TcpStream) {
     }
 }
 
+
 pub fn ws_connect_timeout(timeout: f64) -> Duration {
     if timeout <= 0.0 {
         Duration::from_secs(5)
@@ -596,69 +643,34 @@ pub fn ws_connect_timeout(timeout: f64) -> Duration {
     }
 }
 
-pub fn ws_handshake_timeout(total: Duration) -> Duration {
-    if total <= Duration::ZERO {
-        Duration::from_secs(3)
-    } else if total > Duration::from_secs(3) {
-        Duration::from_secs(3)
-    } else {
-        total
-    }
-}
-
 fn server_name(domain: &str) -> ServerName<'static> {
     ServerName::try_from(domain.to_string())
         .unwrap_or_else(|_| ServerName::IpAddress("127.0.0.1".parse::<IpAddr>().unwrap().into()))
 }
 
-// Типизированный handshake: возвращает готовый RawWebSocket без type-erasure.
-async fn handshake_tls(
-    read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>,
-    mut write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>,
-    domain: &str,
-    path: &str,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
-    let mut ws_key_bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut ws_key_bytes);
-    let ws_key = base64::engine::general_purpose::STANDARD.encode(ws_key_bytes);
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\n\r\n",
-        path, domain, ws_key
-    );
-    match tokio::time::timeout(timeout, write_half.write_all(req.as_bytes())).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(WsError::Io(e)),
-        Err(_) => return Err(WsError::Timeout),
-    }
-    let mut bufreader = BufReader::with_capacity(4096, read_half);
-    let (status_code, first_line, headers) =
-        read_http_response(&mut bufreader, timeout).await?;
-    if status_code == 101 {
-        return Ok(RawWebSocket {
-            reader: tokio::sync::Mutex::new(WsReader::Tls(bufreader)),
-            writer: tokio::sync::Mutex::new(WsWriter::Tls(write_half)),
-            frag: tokio::sync::Mutex::new(Vec::new()),
-            closed: AtomicBool::new(false),
-            secure: true,
-        });
-    }
+fn handshake_error(status_code: i32, status_line: String, headers: HashMap<String, String>) -> WsError {
     let location = headers.get("location").cloned().unwrap_or_default();
-    Err(WsError::Handshake(WsHandshakeError {
+    WsError::Handshake(WsHandshakeError {
         status_code,
-        status_line: first_line,
+        status_line,
         headers,
         location,
-    }))
+    })
 }
 
-async fn handshake_plain(
-    read_half: tokio::io::ReadHalf<TcpStream>,
-    mut write_half: tokio::io::WriteHalf<TcpStream>,
+/// HTTP Upgrade поверх уже установленного транспорта. Заголовки 1-в-1 как в
+/// proxy/raw_websocket.py (без User-Agent). Все стадии делят один дедлайн.
+async fn ws_upgrade<R, W>(
+    read_half: R,
+    mut write_half: W,
     domain: &str,
     path: &str,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
+    deadline: Instant,
+) -> Result<(BufReader<R>, W), WsError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
     let mut ws_key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut ws_key_bytes);
     let ws_key = base64::engine::general_purpose::STANDARD.encode(ws_key_bytes);
@@ -666,38 +678,25 @@ async fn handshake_plain(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\n\r\n",
         path, domain, ws_key
     );
-    match tokio::time::timeout(timeout, write_half.write_all(req.as_bytes())).await {
+    match tokio::time::timeout_at(deadline, write_half.write_all(req.as_bytes())).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(WsError::Io(e)),
         Err(_) => return Err(WsError::Timeout),
     }
     let mut bufreader = BufReader::with_capacity(4096, read_half);
-    let (status_code, first_line, headers) =
-        read_http_response(&mut bufreader, timeout).await?;
+    let (status_code, first_line, headers) = read_http_response(&mut bufreader, deadline).await?;
     if status_code == 101 {
-        return Ok(RawWebSocket {
-            reader: tokio::sync::Mutex::new(WsReader::Plain(bufreader)),
-            writer: tokio::sync::Mutex::new(WsWriter::Plain(write_half)),
-            frag: tokio::sync::Mutex::new(Vec::new()),
-            closed: AtomicBool::new(false),
-            secure: false,
-        });
+        return Ok((bufreader, write_half));
     }
-    let location = headers.get("location").cloned().unwrap_or_default();
-    Err(WsError::Handshake(WsHandshakeError {
-        status_code,
-        status_line: first_line,
-        headers,
-        location,
-    }))
+    Err(handshake_error(status_code, first_line, headers))
 }
 
 async fn read_http_response<R: AsyncReadExt + Unpin>(
     bufreader: &mut BufReader<R>,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<(i32, String, HashMap<String, String>), WsError> {
     let mut response_lines: Vec<String> = Vec::new();
-    let read_result = tokio::time::timeout(timeout, async {
+    let read_result = tokio::time::timeout_at(deadline, async {
         loop {
             let line = read_line(bufreader).await?;
             let line = line.trim_end_matches(['\r', '\n']).to_string();
@@ -718,12 +717,7 @@ async fn read_http_response<R: AsyncReadExt + Unpin>(
         Err(_) => return Err(WsError::Timeout),
     }
     if response_lines.is_empty() {
-        return Err(WsError::Handshake(WsHandshakeError {
-            status_code: 0,
-            status_line: "empty response".to_string(),
-            headers: HashMap::new(),
-            location: String::new(),
-        }));
+        return Err(handshake_error(0, "empty response".to_string(), HashMap::new()));
     }
     let first_line = response_lines[0].clone();
     let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
@@ -734,10 +728,7 @@ async fn read_http_response<R: AsyncReadExt + Unpin>(
     let mut headers = HashMap::new();
     for hl in &response_lines[1..] {
         if let Some(idx) = hl.find(':') {
-            headers.insert(
-                hl[..idx].trim().to_lowercase(),
-                hl[idx + 1..].trim().to_string(),
-            );
+            headers.insert(hl[..idx].trim().to_lowercase(), hl[idx + 1..].trim().to_string());
         }
     }
     Ok((status_code, first_line, headers))
@@ -765,17 +756,11 @@ async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String, Ws
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
-// wsConnectOnce — заголовки 1-в-1 как в Python raw_websocket.py (без User-Agent).
-pub async fn ws_connect_once(
-    dial_addr: &str,
-    domain: &str,
-    path: &str,
-    timeout: Duration,
-) -> Result<RawWebSocket, WsError> {
-    let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
-    ws_connect_once_full(dial_addr, domain, path, timeout, None, secure).await
-}
-
+/// RawWebSocket.connect(host, domain, timeout, path, sni=..., secure=...).
+///
+/// `dial_addr` — куда реально подключаемся (IP или hostname), `domain` — Host
+/// и SNI по умолчанию, `sni` — подмена SNI для domain fronting. TCP connect,
+/// TLS и Upgrade укладываются в один общий `timeout`, как в оригинале.
 pub async fn ws_connect_once_full(
     dial_addr: &str,
     domain: &str,
@@ -784,68 +769,71 @@ pub async fn ws_connect_once_full(
     sni: Option<&str>,
     secure: bool,
 ) -> Result<RawWebSocket, WsError> {
+    let dial_addr = dial_addr.trim();
     if dial_addr.is_empty() {
         return Err(WsError::Other("empty dial address".to_string()));
     }
     let path = if path.is_empty() { WS_PATH } else { path };
-    let target_addr = if secure {
-        format!("{}:443", dial_addr)
-    } else {
-        format!("{}:80", dial_addr)
-    };
+    let port: u16 = if secure { 443 } else { 80 };
+    let deadline = Instant::now() + timeout;
 
-    let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
+    let raw_conn = match tokio::time::timeout_at(deadline, TcpStream::connect((dial_addr, port))).await {
         Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Err(WsError::Io(e)),
+        Ok(Err(e)) => {
+            ldebug!("WS setup failed: host={} port={} stage=tcp error={}", dial_addr, port, e);
+            return Err(WsError::Io(e));
+        }
         Err(_) => return Err(WsError::Timeout),
     };
     set_sock_opts(&raw_conn);
+    let probe = socket2::SockRef::from(&raw_conn).try_clone().ok();
 
     if !secure {
         let (read_half, write_half) = tokio::io::split(raw_conn);
-        return handshake_plain(read_half, write_half, domain, path, timeout).await;
+        let (reader, writer) = ws_upgrade(read_half, write_half, domain, path, deadline).await?;
+        return Ok(RawWebSocket {
+            reader: tokio::sync::Mutex::new(WsReader::Plain(reader)),
+            writer: tokio::sync::Mutex::new(WsWriter::Plain(writer)),
+            frag: tokio::sync::Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            secure: false,
+            probe,
+        });
     }
 
-    let sni_name = sni.unwrap_or(domain);
-    let use_fronting = sni.is_some();
-    let cfg = if use_fronting {
+    let cfg = if sni.is_some() {
         TLS_CONFIG_FRONTING.clone()
     } else {
         TLS_CONFIG.clone()
     };
     let connector = TlsConnector::from(cfg);
-    let sni_server = server_name(sni_name);
-
-    let handshake_timeout = ws_handshake_timeout(timeout);
-    let tls_conn =
-        match tokio::time::timeout(handshake_timeout, connector.connect(sni_server, raw_conn)).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                if e.kind() != std::io::ErrorKind::ConnectionReset {
-                    ldebug!(" ws tls fail {} via {}: {}", domain, dial_addr, e);
-                }
-                return Err(WsError::Io(e));
+    let sni_server = server_name(sni.unwrap_or(domain));
+    let tls_conn = match tokio::time::timeout_at(deadline, connector.connect(sni_server, raw_conn)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            if e.kind() != std::io::ErrorKind::ConnectionReset {
+                ldebug!("WS setup failed: host={} port={} stage=tls error={}", dial_addr, port, e);
             }
-            Err(_) => {
-                ldebug!(" ws tls fail {} via {}: timeout", domain, dial_addr);
-                return Err(WsError::Timeout);
-            }
-        };
+            return Err(WsError::Io(e));
+        }
+        Err(_) => return Err(WsError::Timeout),
+    };
 
     let (read_half, write_half) = tokio::io::split(tls_conn);
-    handshake_tls(read_half, write_half, domain, path, timeout).await
+    let (reader, writer) = ws_upgrade(read_half, write_half, domain, path, deadline).await?;
+    Ok(RawWebSocket {
+        reader: tokio::sync::Mutex::new(WsReader::Tls(reader)),
+        writer: tokio::sync::Mutex::new(WsWriter::Tls(writer)),
+        frag: tokio::sync::Mutex::new(Vec::new()),
+        closed: AtomicBool::new(false),
+        secure: true,
+        probe,
+    })
 }
 
-// wsConnect: пытается ip, при необходимости резолвит DoH
-pub async fn ws_connect(
-    ip: &str,
-    domain: &str,
-    path: &str,
-    timeout: f64,
-) -> Result<RawWebSocket, WsError> {
-    ws_connect_full_opts(ip, domain, path, timeout, None, None).await
-}
-
+/// Подключение по IP либо по hostname; если hostname не подключился (часто —
+/// заблокированный/битый системный DNS на мобильных сетях), повторяем через
+/// DoH-резолв. Весь вызов ограничен общим `timeout`.
 pub async fn ws_connect_full_opts(
     ip: &str,
     domain: &str,
@@ -855,7 +843,8 @@ pub async fn ws_connect_full_opts(
     secure_opt: Option<bool>,
 ) -> Result<RawWebSocket, WsError> {
     let path = if path.is_empty() { WS_PATH } else { path };
-    let attempt_timeout = ws_connect_timeout(timeout);
+    let total = ws_connect_timeout(timeout);
+    let deadline = Instant::now() + total;
     let secure = secure_opt.unwrap_or(!DISABLE_SECURE.load(Ordering::Relaxed));
 
     let primary_addr = if ip.trim().is_empty() {
@@ -864,83 +853,157 @@ pub async fn ws_connect_full_opts(
         ip.trim().to_string()
     };
 
-    match ws_connect_once_full(&primary_addr, domain, path, attempt_timeout, sni, secure).await {
+    let first = ws_connect_once_full(&primary_addr, domain, path, total, sni, secure).await;
+    let err = match first {
         Ok(ws) => return Ok(ws),
-        Err(e) => {
-            if primary_addr == domain && primary_addr.parse::<IpAddr>().is_err() {
-                if let Some(resolved) = crate::cfproxy::resolve_doh(domain).await {
-                    if !resolved.is_empty() && resolved != primary_addr {
-                        return ws_connect_once_full(
-                            &resolved,
-                            domain,
-                            path,
-                            attempt_timeout,
-                            sni,
-                            secure,
-                        )
-                        .await;
-                    }
-                }
+        Err(e) => e,
+    };
+    let is_hostname = primary_addr.parse::<IpAddr>().is_err();
+    if !is_hostname || err.is_timeout() || err.handshake().is_some() {
+        return Err(err);
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(WsError::Timeout);
+    }
+    let resolved = match tokio::time::timeout(remaining, crate::cfproxy::resolve_doh(domain)).await {
+        Ok(Some(r)) if !r.is_empty() && r != primary_addr => r,
+        Ok(_) => return Err(err),
+        Err(_) => return Err(WsError::Timeout),
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(WsError::Timeout);
+    }
+    ldebug!("WS {}: system DNS failed, retry via DoH -> {}", domain, resolved);
+    ws_connect_once_full(&resolved, domain, path, remaining, sni, secure).await
+}
+
+/// WS поверх уже подключённого plain-TCP (тесты и отладка без 80/443).
+pub async fn ws_upgrade_plain(conn: TcpStream, domain: &str, path: &str, timeout: Duration) -> Result<RawWebSocket, WsError> {
+    let probe = socket2::SockRef::from(&conn).try_clone().ok();
+    let (r, w) = tokio::io::split(conn);
+    let (reader, writer) = ws_upgrade(r, w, domain, path, Instant::now() + timeout).await?;
+    Ok(RawWebSocket {
+        reader: tokio::sync::Mutex::new(WsReader::Plain(reader)),
+        writer: tokio::sync::Mutex::new(WsWriter::Plain(writer)),
+        frag: tokio::sync::Mutex::new(Vec::new()),
+        closed: AtomicBool::new(false),
+        secure: false,
+        probe,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    async fn plain_ws_server(listener: TcpListener, response: &'static [u8], then_close: bool) {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let mut got = Vec::new();
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            got.extend_from_slice(&buf[..n]);
+            if got.windows(4).any(|w| w == b"\r\n\r\n") || n == 0 {
+                break;
             }
-            Err(e)
+        }
+        sock.write_all(response).await.unwrap();
+        if then_close {
+            drop(sock);
+        } else {
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
-}
 
-// connectOneWS: перебор доменов (pool refill path, fronting-first как в оригинале)
-pub async fn connect_one_ws(ip: &str, domains: &[String]) -> Option<RawWebSocket> {
-    connect_one_ws_full(ip, domains, WS_PATH, WS_POOL_CONNECT_TIMEOUT).await
-}
-
-pub async fn connect_one_ws_full(
-    ip: &str,
-    domains: &[String],
-    path: &str,
-    timeout: f64,
-) -> Option<RawWebSocket> {
-    // Поведение pool._connect_one: сначала fronting (sni=sprinthost.ru),
-    // затем обычное соединение; Timeout/Reset → fronting fallback.
-    let fronting_first = crate::proxy::ws_pool_fronting_first();
-    for d in domains {
-        if fronting_first {
-            if let Some(ws) = connect_fronted(ip, d, path).await {
-                return Some(ws);
+    #[tokio::test]
+    async fn upgrade_and_stale_detection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(plain_ws_server(
+            listener,
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+            true,
+        ));
+        // ws_connect_once_full дозванивается на 80 — поэтому вызываем ws_upgrade
+        // напрямую поверх уже подключённого сокета.
+        let conn = TcpStream::connect(addr).await.unwrap();
+        let probe = socket2::SockRef::from(&conn).try_clone().ok();
+        let (r, w) = tokio::io::split(conn);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (reader, writer) = ws_upgrade(r, w, "example.org", "/apiws", deadline).await.unwrap();
+        let ws = RawWebSocket {
+            reader: tokio::sync::Mutex::new(WsReader::Plain(reader)),
+            writer: tokio::sync::Mutex::new(WsWriter::Plain(writer)),
+            frag: tokio::sync::Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            secure: false,
+            probe,
+        };
+        server.await.unwrap();
+        // Сервер закрыл соединение — пул должен счесть WS протухшим.
+        let mut stale = false;
+        for _ in 0..50 {
+            if ws.is_stale() {
+                stale = true;
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        match ws_connect_full_opts(ip, d, path, timeout, None, Some(true)).await {
-            Ok(ws) => {
-                crate::proxy::set_ws_pool_fronting_first(false);
-                return Some(ws);
-            }
-            Err(WsError::Timeout) | Err(WsError::Io(_)) => {
-                if fronting_first {
-                    // как в оригинале: при fronting-first таймаут → сразу fronted
-                    return connect_fronted(ip, d, path).await;
-                }
-                if let Some(ws) = connect_fronted(ip, d, path).await {
-                    return Some(ws);
-                }
-            }
+        assert!(stale, "closed peer must be detected as stale");
+    }
+
+    #[tokio::test]
+    async fn idle_connection_is_not_stale() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(plain_ws_server(
+            listener,
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\n",
+            false,
+        ));
+        let conn = TcpStream::connect(addr).await.unwrap();
+        let probe = socket2::SockRef::from(&conn).try_clone().ok();
+        let (r, w) = tokio::io::split(conn);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (reader, writer) = ws_upgrade(r, w, "example.org", "/apiws", deadline).await.unwrap();
+        let ws = RawWebSocket {
+            reader: tokio::sync::Mutex::new(WsReader::Plain(reader)),
+            writer: tokio::sync::Mutex::new(WsWriter::Plain(writer)),
+            frag: tokio::sync::Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            secure: false,
+            probe,
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!ws.is_stale());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_is_reported_as_handshake_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(plain_ws_server(
+            listener,
+            b"HTTP/1.1 302 Found\r\nLocation: https://example.org/\r\n\r\n",
+            true,
+        ));
+        let conn = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = tokio::io::split(conn);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        match ws_upgrade(r, w, "example.org", "/apiws", deadline).await {
             Err(WsError::Handshake(h)) => {
-                if h.is_redirect() {
-                    continue;
-                }
-                return None;
+                assert_eq!(h.status_code, 302);
+                assert!(h.is_redirect());
+                assert_eq!(h.location, "https://example.org/");
             }
-            Err(_) => return None,
+            Err(e) => panic!("unexpected error: {:?}", e),
+            Ok(_) => panic!("302 must not upgrade"),
         }
-    }
-    None
-}
-
-pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWebSocket> {
-    let path = if path.is_empty() { WS_PATH } else { path };
-    match ws_connect_full_opts(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI), Some(true)).await {
-        Ok(ws) => {
-            STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
-            crate::proxy::set_ws_pool_fronting_first(true);
-            Some(ws)
-        }
-        Err(_) => None,
+        server.await.unwrap();
     }
 }

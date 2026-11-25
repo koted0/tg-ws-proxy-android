@@ -127,4 +127,8 @@
     <string name="interval_never">Никогда</string>
     <string name="interval_hours">%1$d ч</string>
     <string name="port_is_not_available">"Порт %1$d используется, пожалуйста попробуйте другой "</string>
+    <string name="cf_custom_domains">Свои домены CF proxy</string>
+    <string name="cf_custom_domains_hint">example.com, example2.com (пусто — встроенный список)</string>
+    <string name="cf_worker_domains">Домены Cloudflare Worker</string>
+    <string name="cf_worker_domains_hint">name.username.workers.dev, … (через запятую)</string>
 </resources>

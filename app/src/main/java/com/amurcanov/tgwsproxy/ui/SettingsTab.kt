@@ -90,6 +90,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
     val savedCustomDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
     val savedCustomDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
+    val savedCfWorkerDomains by settingsStore.cfWorkerDomains.collectAsStateWithLifecycle(initialValue = "")
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
@@ -125,6 +126,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     var cfEnabled by rememberSaveable(savedCfEnabled) { mutableStateOf(savedCfEnabled) }
     var customCfDomainEnabled by rememberSaveable(savedCustomDomainEnabled) { mutableStateOf(savedCustomDomainEnabled) }
     var customCfDomain by rememberSaveable(savedCustomDomain) { mutableStateOf(savedCustomDomain) }
+    var cfWorkerDomains by rememberSaveable(savedCfWorkerDomains) { mutableStateOf(savedCfWorkerDomains) }
     var secretKeyText by remember(savedSecretKey) { mutableStateOf(if (savedSecretKey == "LOADING") "" else savedSecretKey) }
 
     LaunchedEffect(savedSecretKey) {
@@ -149,6 +151,16 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 experimentalMode, bindIpText, portText, selectedPoolSize,
                 cfEnabled, customCfDomainEnabled, customCfDomain, secretKeyText
             )
+        }
+    }
+
+    var cfSaveJob by remember { mutableStateOf<Job?>(null) }
+
+    fun scheduleCfSave() {
+        cfSaveJob?.cancel()
+        cfSaveJob = scope.launch {
+            delay(300)
+            settingsStore.saveCfDomains(customCfDomain.trim(), cfWorkerDomains.trim())
         }
     }
 
@@ -409,6 +421,38 @@ fun SettingsTab(settingsStore: SettingsStore) {
                 )
             }
 
+            // Свои домены: CF proxy (вместо встроенного списка) и Cloudflare
+            // Worker (бесплатный способ из оригинала, пробуется первым).
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (cfEnabled) {
+                    CfDomainField(
+                        label = stringResource(com.amurcanov.tgwsproxy.R.string.cf_custom_domains),
+                        hint = stringResource(com.amurcanov.tgwsproxy.R.string.cf_custom_domains_hint),
+                        value = customCfDomain,
+                        enabled = !isRunning,
+                        onValueChange = {
+                            customCfDomain = it
+                            customCfDomainEnabled = it.isNotBlank()
+                            scheduleSave()
+                            scheduleCfSave()
+                        }
+                    )
+                }
+                CfDomainField(
+                    label = stringResource(com.amurcanov.tgwsproxy.R.string.cf_worker_domains),
+                    hint = stringResource(com.amurcanov.tgwsproxy.R.string.cf_worker_domains_hint),
+                    value = cfWorkerDomains,
+                    enabled = !isRunning,
+                    onValueChange = {
+                        cfWorkerDomains = it
+                        scheduleCfSave()
+                    }
+                )
+            }
+
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))
 
             Row(
@@ -443,6 +487,39 @@ fun SettingsTab(settingsStore: SettingsStore) {
         }
 
         Spacer(Modifier.height(12.dp))
+    }
+}
+
+@Composable
+private fun CfDomainField(
+    label: String,
+    hint: String,
+    value: String,
+    enabled: Boolean,
+    onValueChange: (String) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            label,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.primary
+        )
+        OutlinedTextField(
+            value = value,
+            onValueChange = { raw -> onValueChange(raw.filter { !it.isWhitespace() || it == ' ' }) },
+            enabled = enabled,
+            singleLine = true,
+            placeholder = { Text(hint, style = MaterialTheme.typography.bodySmall) },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            textStyle = MaterialTheme.typography.bodyMedium,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = MaterialTheme.colorScheme.primary,
+                unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+            )
+        )
     }
 }
 

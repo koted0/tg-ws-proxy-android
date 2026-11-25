@@ -39,6 +39,7 @@ class SettingsStore(private val context: Context) {
         val CFPROXY_ENABLED = booleanPreferencesKey("cfproxy_enabled")
         val CUSTOM_CF_DOMAIN_ENABLED = booleanPreferencesKey("custom_cf_domain_enabled")
         val CUSTOM_CF_DOMAIN = stringPreferencesKey("custom_cf_domain")
+        val CF_WORKER_DOMAINS = stringPreferencesKey("cf_worker_domains")
         val AUTO_START_ON_BOOT = booleanPreferencesKey("auto_start_on_boot")
         val SECRET_KEY = stringPreferencesKey("secret_key")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
@@ -85,6 +86,7 @@ class SettingsStore(private val context: Context) {
     val cfproxyEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.CFPROXY_ENABLED] ?: true }
     val customCfDomainEnabled: Flow<Boolean> = context.dataStore.data.map { it[Keys.CUSTOM_CF_DOMAIN_ENABLED] ?: false }
     val customCfDomain: Flow<String> = context.dataStore.data.map { it[Keys.CUSTOM_CF_DOMAIN] ?: "" }
+    val cfWorkerDomains: Flow<String> = context.dataStore.data.map { it[Keys.CF_WORKER_DOMAINS] ?: "" }
     val autoStartOnBoot: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_START_ON_BOOT] ?: false }
     val secretKey: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_KEY] ?: "" }
 
@@ -105,6 +107,15 @@ class SettingsStore(private val context: Context) {
     val updateDialogLastActionVersion: Flow<String> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION_VERSION] ?: "" }
     val updateDialogLastAction: Flow<String> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION] ?: "" }
     val updateDialogLastActionAt: Flow<Long> = context.dataStore.data.map { it[Keys.UPDATE_DIALOG_LAST_ACTION_AT] ?: 0L }
+
+    /** Свои домены CF proxy и домены Cloudflare Worker (списки через запятую). */
+    suspend fun saveCfDomains(customDomain: String, workerDomains: String) {
+        context.dataStore.edit {
+            it[Keys.CUSTOM_CF_DOMAIN] = customDomain
+            it[Keys.CUSTOM_CF_DOMAIN_ENABLED] = customDomain.isNotBlank()
+            it[Keys.CF_WORKER_DOMAINS] = workerDomains
+        }
+    }
 
     suspend fun saveSecretKey(key: String) {
         context.dataStore.edit { it[Keys.SECRET_KEY] = key }

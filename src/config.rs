@@ -8,18 +8,34 @@ use std::time::{Duration, Instant};
 // Constants & Configuration — портировано из proxy/utils.py + tg_ws_proxy.py
 // ---------------------------------------------------------------------------
 
+// Версия Flowseal/tg-ws-proxy, с которой синхронизировано ядро.
+pub const UPSTREAM_VERSION: &str = "1.12.0";
+
 pub const DEFAULT_PORT: u16 = 1443;
 pub const TCP_NODELAY: bool = true;
 pub const DEFAULT_RECV_BUF: usize = 256 * 1024;
 pub const DEFAULT_SEND_BUF: usize = 256 * 1024;
 pub const DEFAULT_POOL_SZ: i32 = 4;
 
-// proxy/tg_ws_proxy.py: IP_FAIL_COOLDOWN / DC_FAIL_COOLDOWN / WS_FAIL_TIMEOUT
-pub const IP_FAIL_COOLDOWN: f64 = 3600.0;
-pub const DC_FAIL_COOLDOWN: f64 = 60.0;
-pub const WS_FAIL_TIMEOUT: f64 = 2.0;
-// Прямой WS-коннект при отсутствии cooldown — 5.0 как в оригинале.
-pub const WS_DIRECT_TIMEOUT: f64 = 5.0;
+// proxy/tg_ws_proxy.py (v1.12): прямые WS-коннекты вне пула убраны —
+// клиент получает WS только из пула, иначе сразу идёт в fallback.
+pub const BAD_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BAD_HANDSHAKE_DRAIN_LIMIT: usize = 64 * 1024;
+pub const LISTENER_RESTART_DELAY: Duration = Duration::from_secs(1);
+// Подряд идущие фатальные ошибки accept() до пересоздания слушающего сокета.
+pub const LISTENER_MAX_ACCEPT_ERRORS: u32 = 20;
+
+// proxy/bridge.py: TCP_BACKOFF_INITIAL / TCP_BACKOFF_MAX
+pub const TCP_BACKOFF_INITIAL: f64 = 30.0;
+pub const TCP_BACKOFF_MAX: f64 = 3600.0;
+
+// proxy/cf_websocket.py: CF_TIMEOUT_COOLDOWN / CF_CONNECT_TIMEOUTS
+pub const CF_TIMEOUT_COOLDOWN: f64 = 30.0;
+pub const CF_CONNECT_TIMEOUTS: [f64; 5] = [3.0, 3.0, 5.0, 5.0, 10.0];
+pub const CF_CONNECT_TIMEOUT: f64 = 10.0;
+
+// proxy/raw_websocket.py: send_init() ограничен 10 секундами.
+pub const WS_INIT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 // proxy/utils.py — MTProto handshake layout
 pub const HANDSHAKE_LEN: usize = 64;
@@ -59,7 +75,11 @@ pub const FRONTING_SNI: &str = "sprinthost.ru";
 
 // proxy/pool.py::_CfWorkerPool
 pub const CF_WORKER_POOL_MAX_AGE: f64 = 100.0;
+pub const CF_WORKER_POOL_CHECK_INTERVAL: f64 = 5.0;
 pub const CF_WORKER_PER_DC_LIMIT: usize = 1;
+pub const CF_WORKER_FAILURE_COOLDOWN: f64 = 60.0;
+pub const CF_WORKER_CONNECT_TIMEOUT: f64 = 8.0;
+pub const CF_WORKER_FALLBACK_TIMEOUT: f64 = 10.0;
 
 // WS пути — proxy/utils.py
 pub const WS_PATH: &str = "/apiws";
@@ -70,19 +90,19 @@ pub const CFPROXY_ACTIVE_FILE_NAME: &str = "cfproxy-active-domain.txt";
 // Оригинал обновляет пул раз в час (3600с) фоновым потоком.
 pub const CFPROXY_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 pub const CFPROXY_MIN_VALID_DOMAINS: usize = 3;
-pub const CFPROXY_DIAL_PHASE_TIMEOUT: Duration = Duration::from_secs(4);
-pub const CFPROXY_FALLBACK_PARALLEL: usize = 2;
 pub const CFPROXY_429_COOLDOWN: Duration = Duration::from_secs(45);
 pub const CFPROXY_429_MAX_COOLDOWN: Duration = Duration::from_secs(300);
-pub const CFPROXY_GLOBAL_PARALLEL: usize = 4;
 
 pub static RECV_BUF: AtomicI32 = AtomicI32::new(DEFAULT_RECV_BUF as i32);
 pub static SEND_BUF: AtomicI32 = AtomicI32::new(DEFAULT_SEND_BUF as i32);
 pub static BUFFER_SIZE: AtomicI32 = AtomicI32::new(256 * 1024);
 pub static POOL_SIZE: AtomicI32 = AtomicI32::new(DEFAULT_POOL_SZ);
 pub static LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
-// proxy/config.py::ProxyConfig — мобильные эквиваленты
-pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(true);
+// proxy/config.py::ProxyConfig — мобильные эквиваленты.
+// disable_secure=false: CF proxy/worker сами переключаются TLS(443) <-> HTTP(80)
+// после таймаутов (Fallback CF-proxy/worker to HTTP after TimeoutError),
+// поэтому сети, где режется 443, работают без ручной настройки.
+pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(false);
 pub static FORCE_TEST_DC: AtomicBool = AtomicBool::new(false);
 pub static PROXY_PROTOCOL: AtomicBool = AtomicBool::new(false);
 
@@ -189,42 +209,8 @@ pub static DC_OVERRIDES: Lazy<HashMap<i32, i32>> = Lazy::new(|| {
     m
 });
 
-// Ключ состояния DC: (dc, is_media, is_test) — аналог строки
-// f'{dc}{"t" if is_test else ""}{"m" if is_media else ""}' из оригинала.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct DcKey {
-    pub dc: i32,
-    pub is_media: i32,
-    pub is_test: i32,
-}
-
-impl DcKey {
-    pub fn new(dc: i32, is_media: bool, is_test: bool) -> Self {
-        DcKey {
-            dc,
-            is_media: if is_media { 1 } else { 0 },
-            is_test: if is_test { 1 } else { 0 },
-        }
-    }
-
-    pub fn as_str_key(&self) -> String {
-        format!(
-            "{}{}{}",
-            self.dc,
-            if self.is_test != 0 { "t" } else { "" },
-            if self.is_media != 0 { "m" } else { "" }
-        )
-    }
-}
-
-// Global state — proxy/tg_ws_proxy.py: ws_blacklist / dc_fail_until / ip_fail_until
+// proxy_config.dc_redirects: DC -> IP (отрицательный ключ = отдельный IP для media).
 pub static DC_OPT: Lazy<RwLock<HashMap<i32, String>>> = Lazy::new(|| RwLock::new(HashMap::new()));
-pub static WS_BLACKLIST: Lazy<RwLock<HashMap<DcKey, bool>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-pub static DC_FAIL_UNTIL: Lazy<RwLock<HashMap<DcKey, f64>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-pub static IP_FAIL_UNTIL: Lazy<RwLock<HashMap<String, f64>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
 
 pub static ZERO64: [u8; 64] = [0u8; 64];
 
@@ -313,6 +299,7 @@ pub fn is_reserved_start(s: &[u8]) -> bool {
         || s4 == [0xee, 0xee, 0xee, 0xee]
         || s4 == [0xdd, 0xdd, 0xdd, 0xdd]
         || s4 == [0x16, 0x03, 0x01, 0x02]
+        || s4 == b"OPTI"
 }
 
 // ---------------------------------------------------------------------------
