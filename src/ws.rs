@@ -756,6 +756,28 @@ async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String, Ws
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
+/// TCP-подключение с приоритетом IPv4. Резолвер Android часто отдаёт IPv6
+/// первым, а до Cloudflare по IPv6 TCP поднимается, но TLS виснет
+/// (Flowseal/tg-ws-proxy#1695). IP-литералы подключаются как есть.
+async fn connect_tcp_ipv4_first(dial_addr: &str, port: u16) -> std::io::Result<TcpStream> {
+    if let Ok(ip) = dial_addr.parse::<IpAddr>() {
+        return TcpStream::connect((ip, port)).await;
+    }
+    let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((dial_addr, port)).await?.collect();
+    // Стабильная сортировка: IPv4 вперёд, порядок резолвера внутри семейства сохраняется.
+    addrs.sort_by_key(|a| a.is_ipv6());
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, format!("no addresses for {}", dial_addr))
+    }))
+}
+
 /// RawWebSocket.connect(host, domain, timeout, path, sni=..., secure=...).
 ///
 /// `dial_addr` — куда реально подключаемся (IP или hostname), `domain` — Host
@@ -777,7 +799,7 @@ pub async fn ws_connect_once_full(
     let port: u16 = if secure { 443 } else { 80 };
     let deadline = Instant::now() + timeout;
 
-    let raw_conn = match tokio::time::timeout_at(deadline, TcpStream::connect((dial_addr, port))).await {
+    let raw_conn = match tokio::time::timeout_at(deadline, connect_tcp_ipv4_first(dial_addr, port)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             ldebug!("WS setup failed: host={} port={} stage=tcp error={}", dial_addr, port, e);
@@ -981,6 +1003,18 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!ws.is_stale());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn hostname_connect_works_and_prefers_ipv4() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().1 });
+        // "localhost" обычно резолвится и в ::1, и в 127.0.0.1; слушаем
+        // только IPv4 — подключение должно пойти туда.
+        let s = connect_tcp_ipv4_first("localhost", port).await.unwrap();
+        assert!(s.peer_addr().unwrap().is_ipv4());
+        accept.await.unwrap();
     }
 
     #[tokio::test]

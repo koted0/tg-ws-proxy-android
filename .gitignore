@@ -34,3 +34,6 @@ target/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Локально собранные APK
+dist/

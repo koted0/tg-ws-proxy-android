@@ -613,6 +613,7 @@ impl Drop for RetryClaim {
 }
 
 /// candidates: (имя для балансера, хост для подключения).
+/// Cooldown таймаутов ведётся по хосту, 429-cooldown — по имени домена.
 pub async fn connect_cf_domains(
     candidates: Vec<(String, String)>,
     label: &str,
@@ -642,7 +643,10 @@ pub async fn connect_cf_domains(
             continue;
         }
 
-        let key = (name.clone(), use_tls);
+        // Карантин по хосту kwsN.<домен>, а не по базовому домену: таймаут
+        // одного DC не должен выключать CF-путь для всех DC
+        // (Flowseal/tg-ws-proxy#1701).
+        let key = (host.clone(), use_tls);
         let retry_at = {
             let mut st = CF_CONN.lock();
             let retry_at = st.timeout_until.get(&key).copied();

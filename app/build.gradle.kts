@@ -106,6 +106,9 @@ android {
                 signingConfig = signingConfigs.getByName("release")
                 println("✅ Signing config applied: ${resolvedFile.absolutePath}")
             } else {
+                // Без keystore подписываем debug-ключом: неподписанный APK
+                // Android установить не даст.
+                signingConfig = signingConfigs.getByName("debug")
                 println("⚠️ WARNING: Keystore not found, using debug signing")
                 println("   Looked for: ${resolvedFile?.absolutePath ?: keyFile}")
             }
@@ -125,11 +128,7 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
-    sourceSets {
-        getByName("main") {
-            jniLibs.srcDirs("src/main/jniLibs")
-        }
-    }
+    // Нативные библиотеки лежат в стандартном src/main/jniLibs (build_so.sh / CI).
 }
 
 dependencies {

@@ -8,6 +8,10 @@ cd "$(dirname "$0")"
 
 if [ -z "${ANDROID_NDK_HOME:-}" ]; then
     sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+    # Как Gradle: sdk.dir из local.properties.
+    if [ -z "$sdk" ] && [ -f local.properties ]; then
+        sdk=$(sed -n 's/^sdk\.dir=//p' local.properties | head -1)
+    fi
     if [ -n "$sdk" ] && [ -d "$sdk/ndk" ]; then
         ANDROID_NDK_HOME="$sdk/ndk/$(ls "$sdk/ndk" | sort -V | tail -1)"
         export ANDROID_NDK_HOME
