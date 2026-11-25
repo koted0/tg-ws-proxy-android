@@ -1,0 +1,11 @@
+[package]
+name = "tgws-fastpath"
+version = "1.0.0"
+edition = "2021"
+description = "Hot data path of tgwsproxy: AES-256-CTR streams and WebSocket masking"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+aes = "0.8"
+ctr = "0.9"

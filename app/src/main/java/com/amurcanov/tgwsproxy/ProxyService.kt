@@ -5,14 +5,21 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
+import android.os.SystemClock
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -24,6 +31,14 @@ import java.net.ServerSocket
 class ProxyService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
+    @Volatile
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile
+    private var screenReceiver: BroadcastReceiver? = null
+    @Volatile
+    private var screenOn = true
+    @Volatile
+    private var lastWakeAtMs = 0L
     private var statsJob: Job? = null
     private var restartJob: Job? = null
     private var lastNotificationContent: String = ""
@@ -66,9 +81,11 @@ class ProxyService : Service() {
         private const val WAKELOCK_TIMEOUT_MS = 30L * 60 * 1000
         private const val WAKELOCK_REFRESH_MS = 25L * 60 * 1000
 
-        // Stats/notification update interval
-        private const val STATS_UPDATE_MS = 3_000L
-        private const val NOTIFICATION_MIN_UPDATE_MS = 3_000L
+        // Stats/notification update interval: реже — меньше пробуждений
+        // системы ради текста уведомления (при выключенном экране не опрашиваем).
+        private const val STATS_UPDATE_MS = 10_000L
+        private const val NOTIFICATION_MIN_UPDATE_MS = 15_000L
+        private const val WAKE_MIN_INTERVAL_MS = 5_000L
         private const val NATIVE_STOP_WAIT_MS = 3_000L
 
         private val _isRunning = MutableStateFlow(false)
@@ -188,10 +205,12 @@ class ProxyService : Service() {
                 NativeProxy.setCfWorkerDomains(cfWorkerDomains)
                 // CF proxy/worker сами переключаются TLS(443) <-> HTTP(80) после таймаутов.
                 NativeProxy.setDisableSecure(false)
-                val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
+                // DEBUG-строки ядра в интерфейсе не показываются — не тратим на них CPU.
+                val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 0)
                 if (result == 0) {
                     serviceScope.launch {
                         if (!stopInProgress) {
+                            registerSystemCallbacks()
                             updateRunningState(true)
                             _isVerifiedRunning.value = true
                             updateNotification(getString(R.string.notification_running), force = true)
@@ -233,7 +252,7 @@ class ProxyService : Service() {
 
             while (isActive) {
                 delay(STATS_UPDATE_MS.milliseconds)
-                if (_isRunning.value && !stopInProgress) {
+                if (_isRunning.value && !stopInProgress && screenOn) {
                     try {
                         val rawStats = NativeProxy.getStats() ?: continue
                         val upRaw = extractStat(rawStats, "up=")
@@ -331,6 +350,7 @@ class ProxyService : Service() {
     private fun stopProxy() {
         if (stopInProgress) return
         stopInProgress = true
+        unregisterSystemCallbacks()
         restartJob?.cancel()
         restartJob = null
         statsJob?.cancel()
@@ -386,6 +406,117 @@ class ProxyService : Service() {
             Log.w(TAG, "onTaskRemoved: proxy is running, service stays alive")
             // The service continues because stopWithTask=false in manifest
             // No action needed — the service keeps running.
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Сеть и экран. При выключенном экране сеть часто пропадает или
+    // переключается (Doze, засыпание Wi-Fi, LTE); ядро должно об этом знать,
+    // иначе копит паузы маршрутов и после разблокировки не подключается.
+    // ---------------------------------------------------------------------
+
+    private fun nativeCall(name: String, block: () -> Unit) {
+        serviceScope.launch {
+            try {
+                block()
+            } catch (e: Throwable) {
+                Log.w(TAG, "$name failed", e)
+            }
+        }
+    }
+
+    private fun registerSystemCallbacks() {
+        registerNetworkCallback()
+        registerScreenReceiver()
+    }
+
+    private fun unregisterSystemCallbacks() {
+        networkCallback?.let { cb ->
+            try {
+                (getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager)?.unregisterNetworkCallback(cb)
+            } catch (_: Exception) {
+            }
+        }
+        networkCallback = null
+        screenReceiver?.let { r ->
+            try {
+                unregisterReceiver(r)
+            } catch (_: Exception) {
+            }
+        }
+        screenReceiver = null
+    }
+
+    private fun registerNetworkCallback() {
+        if (networkCallback != null || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            @Volatile
+            private var current: Network? = null
+            // Последняя сеть, через которую работали (не сбрасывается при onLost).
+            @Volatile
+            private var last: Network? = null
+
+            override fun onAvailable(network: Network) {
+                val prev = last
+                current = network
+                last = network
+                if (prev != null && prev != network) {
+                    // Wi-Fi <-> LTE: сокеты старой сети мертвы.
+                    Log.i(TAG, "Default network changed")
+                    nativeCall("networkChanged") { NativeProxy.networkChanged() }
+                } else {
+                    nativeCall("setNetworkAvailable") { NativeProxy.setNetworkAvailable(true) }
+                }
+            }
+
+            override fun onLost(network: Network) {
+                // При смене Wi-Fi -> LTE onLost(Wi-Fi) может прийти уже после
+                // onAvailable(LTE) — «сети нет» только если пропала текущая.
+                if (network == current) {
+                    current = null
+                    Log.i(TAG, "Default network lost")
+                    nativeCall("setNetworkAvailable") { NativeProxy.setNetworkAvailable(false) }
+                }
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+        } catch (e: Exception) {
+            Log.w(TAG, "registerDefaultNetworkCallback failed", e)
+        }
+    }
+
+    private fun registerScreenReceiver() {
+        if (screenReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    Intent.ACTION_SCREEN_OFF -> screenOn = false
+                    Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                        screenOn = true
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastWakeAtMs >= WAKE_MIN_INTERVAL_MS) {
+                            lastWakeAtMs = now
+                            // Снять паузы, накопленные за время сна, и прогреть пул —
+                            // Telegram подключится сразу после разблокировки.
+                            nativeCall("wake") { NativeProxy.wake() }
+                        }
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        try {
+            ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+            screenReceiver = receiver
+        } catch (e: Exception) {
+            Log.w(TAG, "registerReceiver(screen) failed", e)
         }
     }
 
@@ -510,6 +641,7 @@ class ProxyService : Service() {
     }
 
     override fun onDestroy() {
+        unregisterSystemCallbacks()
         restartJob?.cancel()
         restartJob = null
         statsJob?.cancel()

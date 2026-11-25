@@ -1,7 +1,6 @@
 use crate::config::*;
 use crate::ws::{is_http_status_error, RawWebSocket, WsError};
 use crate::{ldebug, linfo, lwarn};
-use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
@@ -336,14 +335,6 @@ pub async fn try_refresh_cfproxy_domains() -> bool {
         return true;
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
     // Cache-buster как в оригинале ("?" + 7 случайных букв), UA tg-ws-proxy.
     let nonce: String = {
         use rand::Rng;
@@ -352,30 +343,38 @@ pub async fn try_refresh_cfproxy_domains() -> bool {
             .map(|_| rng.gen_range(b'a'..=b'z') as char)
             .collect()
     };
-    let url = format!("{}?{}", CFPROXY_DOMAINS_URL, nonce);
-    let resp = match client
-        .get(&url)
-        .header("User-Agent", "tg-ws-proxy")
-        .send()
+    let path = format!("{}?{}", CFPROXY_DOMAINS_PATH, nonce);
+    // Как _PinnedHTTPSHandler оригинала: сначала закреплённый IP GitHub
+    // (на случай подменённого DNS), затем обычный резолв.
+    let mut resp = None;
+    for ip in [Some(GITHUB_RAW_PINNED_IP), None] {
+        let ip = ip.and_then(|s| s.parse::<std::net::IpAddr>().ok());
+        match crate::https::https_get(
+            CFPROXY_DOMAINS_HOST,
+            ip,
+            &path,
+            "text/plain",
+            Duration::from_secs(10),
+            256 * 1024,
+        )
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            ldebug!(" CF: GitHub недоступен: {}", e);
-            return false;
+        {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => ldebug!(" CF: GitHub недоступен{}: {}", if ip.is_some() { " (pinned IP)" } else { "" }, e),
         }
+    }
+    let resp = match resp {
+        Some(r) => r,
+        None => return false,
     };
-    if resp.status().as_u16() != 200 {
-        ldebug!(" CF: GitHub вернул {}", resp.status().as_u16());
+    if resp.status != 200 {
+        ldebug!(" CF: GitHub вернул {}", resp.status);
         return false;
     }
-    let body = match resp.text().await {
-        Ok(b) => b,
-        Err(e) => {
-            ldebug!(" CF: список доменов прочитать не удалось: {}", e);
-            return false;
-        }
-    };
+    let body = String::from_utf8_lossy(&resp.body).into_owned();
 
     let mut fetched_raw = Vec::new();
     for line in body.lines() {
@@ -422,19 +421,6 @@ pub async fn try_refresh_cfproxy_domains() -> bool {
 // DNS over HTTPS (DoH) resolve
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct DohAnswer {
-    #[serde(rename = "data")]
-    data: String,
-    #[serde(rename = "type")]
-    type_: i32,
-}
-#[derive(Deserialize)]
-struct DohResponse {
-    #[serde(rename = "Answer", default)]
-    answer: Vec<DohAnswer>,
-}
-
 static DOH_CACHE: Lazy<parking_lot::RwLock<std::collections::HashMap<String, (String, Instant)>>> =
     Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
@@ -463,41 +449,38 @@ pub async fn resolve_doh(domain: &str) -> Option<String> {
         }
     }
 
-    let endpoints = [
-        "https://cloudflare-dns.com/dns-query",
-        "https://dns.google/dns-query",
-        "https://dns.quad9.net/dns-query",
-        "https://dns.adguard-dns.com/dns-query",
+    // DoH по IP: сломанный/подменённый системный DNS не мешает дойти до
+    // самого DoH-сервера. Сертификат проверяется по имени в SNI.
+    let endpoints: [(&str, &str, &str); 3] = [
+        ("cloudflare-dns.com", "1.1.1.1", "/dns-query"),
+        ("dns.google", "8.8.8.8", "/resolve"),
+        ("dns.adguard-dns.com", "94.140.14.14", "/resolve"),
     ];
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(1500))
-        .build()
-        .ok()?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(endpoints.len() + 1);
     let mut tasks = Vec::new();
 
-    for u in endpoints {
-        let client = client.clone();
+    for (host, ip, path) in endpoints {
         let domain = domain.to_string();
         let tx = tx.clone();
         tasks.push(tokio::spawn(async move {
-            let full = format!("{}?name={}&type=A", u, domain);
-            if let Ok(resp) = client
-                .get(&full)
-                .header("Accept", "application/dns-json")
-                .send()
-                .await
+            let query = format!("{}?name={}&type=A", path, domain);
+            let ip = ip.parse::<std::net::IpAddr>().ok();
+            if let Ok(resp) = crate::https::https_get(
+                host,
+                ip,
+                &query,
+                "application/dns-json",
+                Duration::from_millis(1500),
+                64 * 1024,
+            )
+            .await
             {
-                if resp.status().as_u16() == 200 {
-                    if let Ok(r) = resp.json::<DohResponse>().await {
-                        for ans in r.answer {
-                            if ans.type_ == 1 {
-                                let _ = tx.send(Some(ans.data)).await;
-                                return;
-                            }
-                        }
+                if resp.status == 200 {
+                    let body = String::from_utf8_lossy(&resp.body);
+                    if let Some(first) = crate::https::doh_json_ipv4(&body).into_iter().next() {
+                        let _ = tx.send(Some(first)).await;
+                        return;
                     }
                 }
             }
@@ -589,6 +572,17 @@ pub fn reset_cf_timeouts() {
     *CF_CONN.lock() = CfConnState::default();
 }
 
+/// Снять cooldown'ы таймаутов. `forget_mode` — забыть и предпочтение
+/// TLS/HTTP (сеть сменилась, на новой может работать другой порт).
+pub fn clear_cf_cooldowns(forget_mode: bool) {
+    let mut st = CF_CONN.lock();
+    st.timeout_until.clear();
+    if forget_mode {
+        st.tls = 0;
+        st.no_tls = 0;
+    }
+}
+
 pub fn cf_prefers_tls() -> bool {
     let st = CF_CONN.lock();
     st.tls >= st.no_tls
@@ -612,8 +606,173 @@ impl Drop for RetryClaim {
     }
 }
 
-/// candidates: (имя для балансера, хост для подключения).
-/// Cooldown таймаутов ведётся по хосту, 429-cooldown — по имени домена.
+/// Параметры гонки CF-маршрутов (идея из pvtarget-glitch/tg-ws-proxy-android):
+/// следующая попытка стартует через STAGGER или сразу после отказа
+/// предыдущей; первая успешная побеждает, остальные отменяются.
+pub const CF_RACE_STAGGER: Duration = Duration::from_millis(700);
+pub const CF_RACE_MAX_PARALLEL: usize = 3;
+pub const CF_RACE_ATTEMPT_TIMEOUT: f64 = 5.0;
+// Сколько попыток (домен+режим) максимум на одно соединение клиента —
+// иначе при недоступном CF клиенты плодили сотни висящих сокетов.
+pub const CF_RACE_MAX_ATTEMPTS: usize = 8;
+
+/// Запускает `attempts` попыток «лесенкой». Возвращает индекс и результат
+/// первой успешной; None — все провалились или вышел общий бюджет.
+pub async fn race<T, F, Fut>(
+    attempts: usize,
+    mut attempt: F,
+    stagger: Duration,
+    max_parallel: usize,
+    budget: Duration,
+) -> Option<(usize, T)>
+where
+    T: Send + 'static,
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Option<T>> + Send + 'static,
+{
+    use tokio::time::Instant;
+    let deadline = Instant::now() + budget;
+    let mut set = tokio::task::JoinSet::new();
+    let (mut next, mut running) = (0usize, 0usize);
+    let mut next_start = Instant::now();
+    loop {
+        while next < attempts && running < max_parallel.max(1) && Instant::now() >= next_start {
+            let idx = next;
+            let fut = attempt(idx);
+            set.spawn(async move { (idx, fut.await) });
+            next += 1;
+            running += 1;
+            next_start = Instant::now() + stagger;
+        }
+        if running == 0 && next >= attempts {
+            return None;
+        }
+        let wake_at = if next < attempts && running < max_parallel.max(1) {
+            next_start.min(deadline)
+        } else {
+            deadline
+        };
+        tokio::select! {
+            joined = set.join_next(), if running > 0 => {
+                running -= 1;
+                if let Some(Ok((idx, Some(value)))) = joined {
+                    set.abort_all();
+                    return Some((idx, value));
+                }
+                // Отказ — следующую попытку не ждём.
+                next_start = Instant::now();
+            }
+            _ = tokio::time::sleep_until(wake_at) => {
+                if Instant::now() >= deadline {
+                    set.abort_all();
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Одна попытка подключения к CF с учётом cooldown пары (хост, tls).
+async fn cf_attempt(name: String, host: String, use_tls: bool, label: String, path: String) -> Option<(RawWebSocket, String)> {
+    if cfproxy_429_cooldown_remaining(&name) > Duration::ZERO {
+        ldebug!("[{}] CF skip {}: 429 cooldown", label, host);
+        return None;
+    }
+    // Карантин по хосту kwsN.<домен>, а не по базовому домену: таймаут
+    // одного DC не должен выключать CF-путь для всех DC
+    // (Flowseal/tg-ws-proxy#1701).
+    let key = (host.clone(), use_tls);
+    let retry_at = {
+        let mut st = CF_CONN.lock();
+        let retry_at = st.timeout_until.get(&key).copied();
+        if let Some(until) = retry_at {
+            if now_monotonic() < until {
+                return None;
+            }
+            // Занимаем слот повторной попытки, чтобы параллельные клиенты
+            // не ломились в тот же хост одновременно.
+            st.timeout_until.insert(key.clone(), f64::INFINITY);
+        }
+        retry_at
+    };
+    let _claim = RetryClaim {
+        key: key.clone(),
+        retry_at,
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs_f64(CF_RACE_ATTEMPT_TIMEOUT),
+        crate::ws::ws_connect_full_opts(
+            &host,
+            &host,
+            &path,
+            CF_RACE_ATTEMPT_TIMEOUT,
+            None,
+            Some(use_tls),
+            crate::ws::CF_DPI_SPLIT.load(std::sync::atomic::Ordering::Relaxed),
+        ),
+    )
+    .await
+    .unwrap_or(Err(WsError::Timeout));
+
+    match result {
+        Ok(ws) => {
+            {
+                let mut st = CF_CONN.lock();
+                st.timeout_until.remove(&key);
+                if use_tls {
+                    st.tls += 1;
+                } else {
+                    st.no_tls += 1;
+                }
+            }
+            clear_cfproxy_429_cooldown(&name);
+            Some((ws, name))
+        }
+        Err(e) if e.is_timeout() => {
+            let now = now_monotonic();
+            let mut st = CF_CONN.lock();
+            if !should_record_failure(None) {
+                // Без сети таймаут ничего не говорит о домене.
+                st.timeout_until.remove(&key);
+            } else if retry_at.is_some() || !st.timeout_until.contains_key(&key) {
+                st.timeout_until.retain(|_, until| *until + CF_TIMEOUT_COOLDOWN > now);
+                st.timeout_until.insert(key, now + CF_TIMEOUT_COOLDOWN);
+                drop(st);
+                lwarn!(
+                    "[{}] CF WebSocket timed out (host={} tls={}); retry in {:.0}s",
+                    label, host, use_tls, CF_TIMEOUT_COOLDOWN
+                );
+            }
+            None
+        }
+        Err(e) => {
+            CF_CONN.lock().timeout_until.remove(&key);
+            if let WsError::Io(io) = &e {
+                if !should_record_failure(Some(io)) {
+                    ldebug!("[{}] CF WebSocket: no network ({})", label, io);
+                    return None;
+                }
+            }
+            if is_http_status_error(&e, 429) {
+                mark_cfproxy_429_cooldown(&name, &e);
+            }
+            log_cf_conn_error(
+                &format!("[{}] CF WebSocket failed (host={} tls={}): {}", label, host, use_tls, e.compact()),
+                &e,
+            );
+            None
+        }
+    }
+}
+
+/// candidates: (имя для балансера, хост для подключения), в порядке
+/// предпочтения (первым — домен, который недавно работал для этого DC).
+///
+/// Порт proxy/cf_websocket.py (Flowseal v1.12) — cooldown пары (хост, tls),
+/// предпочтение режима, который чаще срабатывал, переключение TLS(443) ⇄
+/// HTTP(80) — но попытки идут гонкой, а не строго по очереди: заблокированный
+/// домен больше не стоит каждому соединению 3–5 секунд таймаута.
 pub async fn connect_cf_domains(
     candidates: Vec<(String, String)>,
     label: &str,
@@ -621,106 +780,138 @@ pub async fn connect_cf_domains(
     path: &str,
     timeout: f64,
 ) -> Option<(RawWebSocket, String)> {
-    let mut domains = candidates;
-    let retry_single_domain = secure && domains.len() == 1;
-    if retry_single_domain {
-        let first = domains[0].clone();
-        domains.push(first);
+    let tls_first = secure && cf_prefers_tls();
+    // Для каждого домена — предпочтительный режим и сразу за ним второй:
+    // если 443 молчит, через STAGGER пробуется 80 (и наоборот).
+    let mut attempts: Vec<(String, String, bool)> = Vec::new();
+    for (name, host) in candidates {
+        attempts.push((name.clone(), host.clone(), tls_first));
+        if secure {
+            attempts.push((name, host, !tls_first));
+        }
+        if attempts.len() >= CF_RACE_MAX_ATTEMPTS {
+            break;
+        }
     }
+    attempts.truncate(CF_RACE_MAX_ATTEMPTS);
+    if attempts.is_empty() {
+        return None;
+    }
+    let label = label.to_string();
+    let path = path.to_string();
+    let budget = Duration::from_secs_f64(timeout.max(CF_RACE_ATTEMPT_TIMEOUT));
+    let list = attempts.clone();
+    race(
+        list.len(),
+        move |i| {
+            let (name, host, tls) = list[i].clone();
+            cf_attempt(name, host, tls, label.clone(), path.clone())
+        },
+        CF_RACE_STAGGER,
+        CF_RACE_MAX_PARALLEL,
+        budget,
+    )
+    .await
+    .map(|(_, won)| won)
+}
 
-    let mut timeouts = 0usize;
-    let tls_first = cf_prefers_tls();
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use std::time::Instant;
 
-    for (index, (name, host)) in domains.iter().enumerate() {
-        let mut use_tls = secure && (tls_first != (timeouts % 2 == 1));
-        if retry_single_domain && index == 1 && timeouts == 0 {
-            // Первая попытка была пропущена из-за cooldown — пробуем другой режим.
-            use_tls = !tls_first;
-        }
-
-        if cfproxy_429_cooldown_remaining(name) > Duration::ZERO {
-            ldebug!("[{}] CF skip {}: 429 cooldown", label, host);
-            continue;
-        }
-
-        // Карантин по хосту kwsN.<домен>, а не по базовому домену: таймаут
-        // одного DC не должен выключать CF-путь для всех DC
-        // (Flowseal/tg-ws-proxy#1701).
-        let key = (host.clone(), use_tls);
-        let retry_at = {
-            let mut st = CF_CONN.lock();
-            let retry_at = st.timeout_until.get(&key).copied();
-            if let Some(until) = retry_at {
-                if now_monotonic() < until {
-                    continue;
+    #[tokio::test]
+    async fn first_failure_starts_next_immediately() {
+        let t = Instant::now();
+        let r = race(
+            3,
+            |i| async move {
+                if i == 0 {
+                    None
+                } else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some(i)
                 }
-                // Занимаем слот повторной попытки, чтобы параллельные клиенты
-                // не ломились в тот же домен одновременно.
-                st.timeout_until.insert(key.clone(), f64::INFINITY);
-            }
-            retry_at
-        };
-        let _claim = RetryClaim {
-            key: key.clone(),
-            retry_at,
-        };
-
-        let attempt_timeout = timeout.min(CF_CONNECT_TIMEOUTS[timeouts]);
-        let result = tokio::time::timeout(
-            Duration::from_secs_f64(attempt_timeout),
-            crate::ws::ws_connect_full_opts(host, host, path, attempt_timeout, None, Some(use_tls)),
+            },
+            Duration::from_secs(5),
+            3,
+            Duration::from_secs(5),
         )
-        .await
-        .unwrap_or(Err(WsError::Timeout));
-
-        match result {
-            Err(e) if e.is_timeout() => {
-                let now = now_monotonic();
-                let mut st = CF_CONN.lock();
-                if retry_at.is_some() || !st.timeout_until.contains_key(&key) {
-                    st.timeout_until.retain(|_, until| *until + CF_TIMEOUT_COOLDOWN > now);
-                    st.timeout_until.insert(key.clone(), now + CF_TIMEOUT_COOLDOWN);
-                    drop(st);
-                    lwarn!(
-                        "[{}] CF WebSocket timed out (host={} tls={}); retry in {:.0}s",
-                        label, host, use_tls, CF_TIMEOUT_COOLDOWN
-                    );
-                }
-                timeouts += 1;
-                if timeouts >= CF_CONNECT_TIMEOUTS.len() {
-                    break;
-                }
-                continue;
-            }
-            Err(e) => {
-                CF_CONN.lock().timeout_until.remove(&key);
-                if is_http_status_error(&e, 429) {
-                    mark_cfproxy_429_cooldown(name, &e);
-                }
-                log_cf_conn_error(
-                    &format!("[{}] CF WebSocket failed (host={} tls={}): {}", label, host, use_tls, e.compact()),
-                    &e,
-                );
-                if retry_single_domain {
-                    break;
-                }
-            }
-            Ok(ws) => {
-                {
-                    let mut st = CF_CONN.lock();
-                    st.timeout_until.remove(&key);
-                    if use_tls {
-                        st.tls += 1;
-                    } else {
-                        st.no_tls += 1;
-                    }
-                }
-                clear_cfproxy_429_cooldown(name);
-                return Some((ws, name.clone()));
-            }
-        }
+        .await;
+        assert_eq!(r, Some((1, 1)));
+        assert!(t.elapsed() < Duration::from_secs(1), "must not wait for stagger after a failure");
     }
-    None
+
+    #[tokio::test]
+    async fn silent_attempt_is_overtaken_after_stagger() {
+        let t = Instant::now();
+        let r = race(
+            2,
+            |i| async move {
+                if i == 0 {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    Some(0)
+                } else {
+                    Some(1)
+                }
+            },
+            Duration::from_millis(50),
+            3,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(r, Some((1, 1)));
+        let e = t.elapsed();
+        assert!(e >= Duration::from_millis(45) && e < Duration::from_secs(2), "{:?}", e);
+    }
+
+    #[tokio::test]
+    async fn all_fail_or_budget_runs_out() {
+        let r: Option<(usize, u8)> = race(4, |_| async { None }, Duration::from_millis(10), 2, Duration::from_secs(5)).await;
+        assert!(r.is_none());
+        let t = Instant::now();
+        let r: Option<(usize, u8)> = race(
+            4,
+            |_| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Some(1)
+            },
+            Duration::from_millis(10),
+            2,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(r.is_none());
+        assert!(t.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn parallelism_is_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (l, p) = (live.clone(), peak.clone());
+        let r: Option<(usize, ())> = race(
+            6,
+            move |_| {
+                let (l, p) = (l.clone(), p.clone());
+                async move {
+                    let now = l.fetch_add(1, Ordering::SeqCst) + 1;
+                    p.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    l.fetch_sub(1, Ordering::SeqCst);
+                    None
+                }
+            },
+            Duration::from_millis(1),
+            2,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(r.is_none());
+        assert!(peak.load(Ordering::SeqCst) <= 2);
+    }
 }
 
 pub fn log_cf_conn_error(msg: &str, err: &WsError) {

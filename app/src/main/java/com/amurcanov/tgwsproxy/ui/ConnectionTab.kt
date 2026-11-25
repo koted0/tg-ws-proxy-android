@@ -35,7 +35,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.amurcanov.tgwsproxy.BackgroundWork
 import com.amurcanov.tgwsproxy.BuildConfig
 import com.amurcanov.tgwsproxy.ProxyController
 import com.amurcanov.tgwsproxy.ProxyService
@@ -47,6 +49,13 @@ import kotlinx.coroutines.launch
 fun ConnectionTab(settingsStore: SettingsStore) {
     val context = LocalContext.current
     val isRunning by ProxyService.isRunning.collectAsStateWithLifecycle()
+    val bannerContext = LocalContext.current
+    // Перепроверяем при каждом возвращении на экран (после системного диалога).
+    var backgroundAllowed by remember { mutableStateOf(BackgroundWork.isIgnoringBatteryOptimizations(bannerContext)) }
+    LifecycleResumeEffect(Unit) {
+        backgroundAllowed = BackgroundWork.isIgnoringBatteryOptimizations(bannerContext)
+        onPauseOrDispose { }
+    }
     val isVerifiedRunning by ProxyService.isVerifiedRunning.collectAsStateWithLifecycle()
 
     val isReady by settingsStore.isReady.collectAsStateWithLifecycle(initialValue = false)
@@ -236,6 +245,23 @@ fun ConnectionTab(settingsStore: SettingsStore) {
                         color = statusColor,
                         textAlign = TextAlign.Center
                     )
+
+                    if (!backgroundAllowed) {
+                        Surface(
+                            onClick = { BackgroundWork.requestIgnoreBatteryOptimizations(context) },
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = stringResource(R.string.battery_optimization_banner),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                            )
+                        }
+                    }
 
                     Column(
                         modifier = Modifier.fillMaxWidth(),

@@ -25,13 +25,14 @@ pub const LISTENER_RESTART_DELAY: Duration = Duration::from_secs(1);
 // Подряд идущие фатальные ошибки accept() до пересоздания слушающего сокета.
 pub const LISTENER_MAX_ACCEPT_ERRORS: u32 = 20;
 
-// proxy/bridge.py: TCP_BACKOFF_INITIAL / TCP_BACKOFF_MAX
-pub const TCP_BACKOFF_INITIAL: f64 = 30.0;
-pub const TCP_BACKOFF_MAX: f64 = 3600.0;
+// proxy/bridge.py: TCP_BACKOFF_INITIAL / TCP_BACKOFF_MAX. Потолок ниже, чем
+// в оригинале (1 ч): на телефоне сеть пропадает при выключенном экране, и
+// часовая пауза после этого превращалась в «прокси не коннектится».
+pub const TCP_BACKOFF_INITIAL: f64 = 15.0;
+pub const TCP_BACKOFF_MAX: f64 = 120.0;
 
-// proxy/cf_websocket.py: CF_TIMEOUT_COOLDOWN / CF_CONNECT_TIMEOUTS
+// proxy/cf_websocket.py: CF_TIMEOUT_COOLDOWN (попытки теперь идут гонкой, см. cfproxy::race)
 pub const CF_TIMEOUT_COOLDOWN: f64 = 30.0;
-pub const CF_CONNECT_TIMEOUTS: [f64; 5] = [3.0, 3.0, 5.0, 5.0, 10.0];
 pub const CF_CONNECT_TIMEOUT: f64 = 10.0;
 
 // proxy/raw_websocket.py: send_init() ограничен 10 секундами.
@@ -57,8 +58,12 @@ pub const PROTO_PADDED_INTERMEDIATE_INT: u32 = 0xDDDDDDDD;
 // proxy/utils.py — зарезервированные префиксы relay_init
 pub const RESERVED_FIRST_BYTE: u8 = 0xEF;
 
-pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(120);
-pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(30);
+// Сессия закрывается только после тишины в обе стороны (как
+// --client-idle-timeout в tg-ws-proxy-rs). 120 с рвали фоновое соединение
+// Telegram при заблокированном экране.
+pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(900);
+// WS ping в простое: Cloudflare закрывает молчащий WebSocket через ~100 с.
+pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(45);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 pub const WS_BRIDGE_CHUNK_SIZE: usize = 64 * 1024;
@@ -68,7 +73,8 @@ pub const POOLED_FRAME_CAP: usize = WS_BRIDGE_CHUNK_SIZE + 32;
 pub const WS_POOL_REUSE_MAX_AGE: f64 = 120.0;
 pub const WS_POOL_CHECK_INTERVAL: f64 = 5.0;
 pub const WS_POOL_REFILL_BACKOFF_INITIAL: f64 = 1.0;
-pub const WS_POOL_REFILL_BACKOFF_MAX: f64 = 3600.0;
+// Оригинал: 3600 с. На мобиле пул после потери сети оживал бы час.
+pub const WS_POOL_REFILL_BACKOFF_MAX: f64 = 60.0;
 pub const WS_POOL_CONNECT_TIMEOUT: f64 = 8.0;
 pub const WS_POOL_FRONTING_TIMEOUT: f64 = 7.0;
 pub const FRONTING_SNI: &str = "sprinthost.ru";
@@ -98,6 +104,32 @@ pub static SEND_BUF: AtomicI32 = AtomicI32::new(DEFAULT_SEND_BUF as i32);
 pub static BUFFER_SIZE: AtomicI32 = AtomicI32::new(256 * 1024);
 pub static POOL_SIZE: AtomicI32 = AtomicI32::new(DEFAULT_POOL_SZ);
 pub static LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
+// Состояние сети от Android (ConnectivityManager). Пока сети нет, провалы
+// подключений не записываются в backoff/cooldown: иначе после выключенного
+// экрана все маршруты оказывались «на паузе» и прокси не подключался.
+// ---------------------------------------------------------------------------
+
+pub static NET_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+pub fn network_down() -> bool {
+    !NET_AVAILABLE.load(Ordering::Relaxed)
+}
+
+/// Ошибка означает «нет сети/маршрута», а не проблему конкретного маршрута.
+pub fn is_no_network_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        NetworkUnreachable | HostUnreachable | NetworkDown | AddrNotAvailable
+    )
+}
+
+/// Провал стоит учитывать в паузах маршрута только при наличии сети.
+pub fn should_record_failure(e: Option<&std::io::Error>) -> bool {
+    !network_down() && !e.is_some_and(is_no_network_error)
+}
 // proxy/config.py::ProxyConfig — мобильные эквиваленты.
 // disable_secure=false: CF proxy/worker сами переключаются TLS(443) <-> HTTP(80)
 // после таймаутов (Fallback CF-proxy/worker to HTTP after TimeoutError),
@@ -146,8 +178,11 @@ pub static FAKE_TLS_DOMAIN: Lazy<RwLock<String>> =
 pub static CFPROXY_429: Lazy<RwLock<HashMap<String, Cfproxy429State>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-pub const CFPROXY_DOMAINS_URL: &str =
-    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt";
+// https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt
+pub const CFPROXY_DOMAINS_HOST: &str = "raw.githubusercontent.com";
+pub const CFPROXY_DOMAINS_PATH: &str = "/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt";
+// proxy/utils.py::_GITHUB_IPS
+pub const GITHUB_RAW_PINNED_IP: &str = "185.199.109.133";
 
 // MTProto proxy secret
 pub static PROXY_SECRET: Lazy<RwLock<String>> =
@@ -542,6 +577,10 @@ pub fn log_warn(msg: &str) {
 pub fn log_error(msg: &str) {
     emit("[ERROR] ", msg);
 }
+pub fn debug_enabled() -> bool {
+    LOG_VERBOSE.load(Ordering::Relaxed)
+}
+
 pub fn log_debug(msg: &str) {
     if LOG_VERBOSE.load(Ordering::Relaxed) {
         emit("[DEBUG] ", msg);
@@ -555,7 +594,7 @@ macro_rules! lwarn  { ($($a:tt)*) => { $crate::config::log_warn(&format!($($a)*)
 #[macro_export]
 macro_rules! lerror { ($($a:tt)*) => { $crate::config::log_error(&format!($($a)*)) }; }
 #[macro_export]
-macro_rules! ldebug { ($($a:tt)*) => { $crate::config::log_debug(&format!($($a)*)) }; }
+macro_rules! ldebug { ($($a:tt)*) => { if $crate::config::debug_enabled() { $crate::config::log_debug(&format!($($a)*)) } }; }
 
 pub fn init_logging(verbose: bool) {
     LOG_VERBOSE.store(verbose, Ordering::Relaxed);

@@ -1,0 +1,6 @@
+# Аппаратный AES (ARMv8 Cryptography Extensions) для arm64. Крейт `aes`
+# включает его только с этим cfg, а наличие инструкций проверяет в рантайме
+# (cpufeatures, getauxval) — на старых ядрах останется программный путь.
+# Без флага весь трафик шифровался программно, в разы медленнее.
+[target.aarch64-linux-android]
+rustflags = ["--cfg", "aes_armv8"]

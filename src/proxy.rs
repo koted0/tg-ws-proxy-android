@@ -196,6 +196,10 @@ impl WsPool {
         if pool_size() == 0 || self.cancel.is_cancelled() {
             return;
         }
+        // Без сети не дёргаем радио зря; пул прогреется по SetNetworkAvailable.
+        if network_down() {
+            return;
+        }
         self.schedule_rotation(key, target_ip.clone());
         let gen = {
             let mut st = self.state.lock();
@@ -262,6 +266,8 @@ impl WsPool {
                 if connected > 0 {
                     st.refill_failures.remove(&key);
                     st.refill_after.remove(&key);
+                } else if !should_record_failure(None) {
+                    st.refill_after.insert(key, now_monotonic() + 5.0);
                 } else {
                     let failures = st.refill_failures.get(&key).copied().unwrap_or(0) + 1;
                     st.refill_failures.insert(key, failures);
@@ -349,7 +355,7 @@ impl WsPool {
         self.state.lock().rotating.remove(&key);
     }
 
-    pub fn warmup(self: &Arc<Self>) {
+    pub fn warmup(self: &Arc<Self>, log: bool) {
         let dcs: Vec<i32> = {
             let map = DC_OPT.read();
             let mut v: Vec<i32> = map.keys().map(|k| k.abs()).collect();
@@ -371,7 +377,18 @@ impl WsPool {
                 n += 1;
             }
         }
-        linfo!("WS pool warmup started for {} DC(s)", n);
+        if log {
+            linfo!("WS pool warmup started for {} DC(s)", n);
+        } else {
+            ldebug!("WS pool warmup started for {} DC(s)", n);
+        }
+    }
+
+    /// Сброс backoff пополнения (сеть вернулась / экран включён).
+    pub fn reset_backoff(&self) {
+        let mut st = self.state.lock();
+        st.refill_failures.clear();
+        st.refill_after.clear();
     }
 
     pub fn close_all(&self) {
@@ -411,6 +428,7 @@ async fn connect_pooled_ws(target_ip: &str, domains: &[String], path: &str) -> O
                 Duration::from_secs_f64(timeout),
                 sni,
                 true,
+                false,
             )
             .await
             {
@@ -459,7 +477,8 @@ struct CfWorkerState {
     rotating: HashSet<i32>,
     refill_failures: HashMap<i32, u32>,
     refill_after: HashMap<i32, f64>,
-    exhausted_until: HashMap<String, f64>,
+    // домен воркера -> (до какого момента пауза, дневной лимит 429)
+    exhausted_until: HashMap<String, (f64, bool)>,
 }
 
 impl CfWorkerState {
@@ -467,7 +486,7 @@ impl CfWorkerState {
     fn defer_if_all_workers_paused(&mut self, dc: i32, worker_domains: &[String], now: f64) -> bool {
         let first_available = worker_domains
             .iter()
-            .map(|d| self.exhausted_until.get(d).copied().unwrap_or(now))
+            .map(|d| self.exhausted_until.get(d).map_or(now, |e| e.0))
             .fold(f64::INFINITY, f64::min);
         if first_available <= now {
             return false;
@@ -548,7 +567,7 @@ impl CfWorkerPool {
     }
 
     fn schedule_refill(self: &Arc<Self>, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
-        if pool_size() == 0 || worker_domains.is_empty() || self.cancel.is_cancelled() {
+        if pool_size() == 0 || worker_domains.is_empty() || self.cancel.is_cancelled() || network_down() {
             return;
         }
         self.schedule_rotation(dc, fallback_dst.clone(), worker_domains.clone());
@@ -610,6 +629,8 @@ impl CfWorkerPool {
             if connected > 0 {
                 st.refill_failures.remove(&dc);
                 st.refill_after.remove(&dc);
+            } else if !should_record_failure(None) {
+                st.refill_after.insert(dc, now + 5.0);
             } else if !st.defer_if_all_workers_paused(dc, &worker_domains, now) {
                 let failures = st.refill_failures.get(&dc).copied().unwrap_or(0) + 1;
                 st.refill_failures.insert(dc, failures);
@@ -715,7 +736,15 @@ impl CfWorkerPool {
             for (attempt, &secure) in modes.iter().enumerate() {
                 let res = tokio::time::timeout(
                     Duration::from_secs_f64(timeout),
-                    ws_connect_full_opts(&worker_domain, &worker_domain, &path, timeout, None, Some(secure)),
+                    ws_connect_full_opts(
+                        &worker_domain,
+                        &worker_domain,
+                        &path,
+                        timeout,
+                        None,
+                        Some(secure),
+                        CF_DPI_SPLIT.load(Ordering::Relaxed),
+                    ),
                 )
                 .await
                 .unwrap_or(Err(WsError::Timeout));
@@ -753,7 +782,7 @@ impl CfWorkerPool {
             if domains.contains(domain) {
                 continue;
             }
-            let until = st.exhausted_until.get(domain).copied().unwrap_or(0.0);
+            let until = st.exhausted_until.get(domain).map_or(0.0, |e| e.0);
             if until > now {
                 continue;
             }
@@ -773,24 +802,26 @@ impl CfWorkerPool {
     /// ошибки — пауза 60с. Челлендж/кривой маршрут домен не выключают.
     pub fn report_failure(&self, worker_domain: &str, err: &WsError) {
         let now = now_monotonic();
-        let (until, reason) = match err {
+        let (until, reason, daily) = match err {
             WsError::Handshake(h) if h.status_code == 429 => {
                 let secs_left = 86400.0 - (now_unix_f64() % 86400.0);
-                (now + secs_left, "daily request limit".to_string())
+                (now + secs_left, "daily request limit".to_string(), true)
             }
             WsError::Handshake(h) if h.status_code >= 500 => {
-                (now + CF_WORKER_FAILURE_COOLDOWN, format!("HTTP {}", h.status_code))
+                (now + CF_WORKER_FAILURE_COOLDOWN, format!("HTTP {}", h.status_code), false)
             }
             WsError::Handshake(_) => return,
-            WsError::Io(_) | WsError::Timeout => (now + CF_WORKER_FAILURE_COOLDOWN, err.compact()),
+            WsError::Io(e) if !should_record_failure(Some(e)) => return,
+            WsError::Timeout if !should_record_failure(None) => return,
+            WsError::Io(_) | WsError::Timeout => (now + CF_WORKER_FAILURE_COOLDOWN, err.compact(), false),
             _ => return,
         };
         {
             let mut st = self.state.lock();
-            if st.exhausted_until.get(worker_domain).copied().unwrap_or(0.0) > now {
+            if st.exhausted_until.get(worker_domain).map_or(0.0, |e| e.0) > now {
                 return;
             }
-            st.exhausted_until.insert(worker_domain.to_string(), until);
+            st.exhausted_until.insert(worker_domain.to_string(), (until, daily));
         }
         lwarn!(
             "CF worker {} disabled for {} seconds: {}",
@@ -800,7 +831,16 @@ impl CfWorkerPool {
         );
     }
 
-    pub fn warmup(self: &Arc<Self>) {
+    /// Сброс пауз после возвращения сети / включения экрана. Дневной лимит
+    /// воркера (429) не сбрасывается — он от сети не зависит.
+    pub fn reset_backoff(&self) {
+        let mut st = self.state.lock();
+        st.refill_failures.clear();
+        st.refill_after.clear();
+        st.exhausted_until.retain(|_, (_, daily)| *daily);
+    }
+
+    pub fn warmup(self: &Arc<Self>, log: bool) {
         let worker_domains = CF_WORKER_DOMAINS.read().clone();
         if pool_size() == 0 || worker_domains.is_empty() {
             return;
@@ -819,7 +859,9 @@ impl CfWorkerPool {
         for (dc, fallback_dst) in &fallbacks {
             self.schedule_refill(*dc, fallback_dst.clone(), worker_domains.clone());
         }
-        linfo!("CF worker pool warmup started for {} DC(s)", fallbacks.len());
+        if log {
+            linfo!("CF worker pool warmup started for {} DC(s)", fallbacks.len());
+        }
     }
 
     pub fn close_all(&self) {
@@ -856,9 +898,9 @@ impl ProxyPools {
         }
     }
 
-    pub fn warmup(&self) {
-        self.ws.warmup();
-        self.cf_worker.warmup();
+    pub fn warmup(&self, log: bool) {
+        self.ws.warmup(log);
+        self.cf_worker.warmup(log);
     }
 
     pub fn close_all(&self) {
@@ -869,6 +911,11 @@ impl ProxyPools {
     pub fn reset(&self) {
         self.ws.reset();
         self.cf_worker.reset();
+    }
+
+    pub fn reset_backoff(&self) {
+        self.ws.reset_backoff();
+        self.cf_worker.reset_backoff();
     }
 }
 
@@ -977,6 +1024,10 @@ pub async fn bridge_ws<R, W>(
         let last_activity = last_activity.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; WS_BRIDGE_CHUNK_SIZE];
+            // Открытый текст куска (для границ пакетов) и собранные WS-фреймы —
+            // переиспользуемые буферы, без аллокаций на каждый пакет.
+            let mut plain: Vec<u8> = Vec::with_capacity(if splitter.is_some() { WS_BRIDGE_CHUNK_SIZE } else { 0 });
+            let mut frames: Vec<u8> = Vec::with_capacity(WS_BRIDGE_CHUNK_SIZE + 1024);
             let mut bytes = 0i64;
             let mut packets = 0i64;
             let mut reason = String::new();
@@ -1016,19 +1067,20 @@ pub async fn bridge_ws<R, W>(
                 last_activity.store(now_ms(), Ordering::Relaxed);
 
                 clt_dec.xor(chunk);
-                tg_enc.xor(chunk);
-
-                let sent = match splitter.as_mut() {
+                frames.clear();
+                match splitter.as_mut() {
                     Some(sp) => {
-                        let parts = sp.split(chunk);
-                        match parts.len() {
-                            0 => Ok(()),
-                            1 => ws.send(&parts[0]).await,
-                            _ => ws.send_batch(&parts).await,
-                        }
+                        plain.clear();
+                        plain.extend_from_slice(chunk);
+                        tg_enc.xor(chunk);
+                        sp.split_with(chunk, &plain, |part| append_frame(&mut frames, OP_BINARY, part));
                     }
-                    None => ws.send(chunk).await,
-                };
+                    None => {
+                        tg_enc.xor(chunk);
+                        append_frame(&mut frames, OP_BINARY, chunk);
+                    }
+                }
+                let sent = ws.send_raw_frames(&frames).await;
                 if sent.is_err() {
                     reason = "upstream: send_failed".to_string();
                     break;
@@ -1261,8 +1313,8 @@ async fn tcp_fallback_connect(dst: &str, port: u16, relay_init: &[u8], label: &s
     };
     let result = match tokio::time::timeout(Duration::from_secs(10), attempt).await {
         Ok(Ok(r)) => Ok(r),
-        Ok(Err(e)) => Err(e.to_string()),
-        Err(_) => Err("timeout".to_string()),
+        Ok(Err(e)) => Err((e.to_string(), should_record_failure(Some(&e)))),
+        Err(_) => Err(("timeout".to_string(), should_record_failure(None))),
     };
     let mut b = TCP_BACKOFF.lock();
     b.connecting.remove(&key);
@@ -1272,7 +1324,12 @@ async fn tcp_fallback_connect(dst: &str, port: u16, relay_init: &[u8], label: &s
             b.retry_after.remove(&key);
             Some(remote)
         }
-        Err(e) => {
+        Err((e, false)) => {
+            drop(b);
+            ldebug!("[{}] TCP fallback to {}:{} failed without network: {}", label, dst, port, e);
+            None
+        }
+        Err((e, true)) => {
             let failures = b.failures.get(&key).copied().unwrap_or(0) + 1;
             b.failures.insert(key.clone(), failures);
             let delay = backoff_delay(TCP_BACKOFF_INITIAL, failures, 7, TCP_BACKOFF_MAX);
@@ -1321,8 +1378,42 @@ async fn cfproxy_worker_acquire(
     Some(ws)
 }
 
+// Холодный перебор CF для DC делает одно соединение; одновременные (Telegram
+// открывает по 3–4 сразу) ждут его и идут к победителю, а не запускают каждое
+// свой перебор. Пока для DC есть недавний успех, соединения идут параллельно.
+static CF_DIAL_LOCKS: once_cell::sync::Lazy<SyncMutex<HashMap<i32, Arc<tokio::sync::Mutex<()>>>>> =
+    once_cell::sync::Lazy::new(|| SyncMutex::new(HashMap::new()));
+static CF_LAST_OK: once_cell::sync::Lazy<SyncMutex<HashMap<i32, f64>>> =
+    once_cell::sync::Lazy::new(|| SyncMutex::new(HashMap::new()));
+const CF_WARM_WINDOW: f64 = 120.0;
+
+fn cf_recently_ok(dc: i32) -> bool {
+    CF_LAST_OK
+        .lock()
+        .get(&dc)
+        .is_some_and(|t| now_monotonic() - *t < CF_WARM_WINDOW)
+}
+
+pub fn reset_cf_dial_state() {
+    CF_LAST_OK.lock().clear();
+}
+
 /// bridge._cfproxy_fallback (без клиента): WS к kwsN.<домен> через CF proxy.
 async fn cfproxy_acquire(label: &str, dc: i32, is_media: bool) -> Option<RawWebSocket> {
+    let _cold_guard = if cf_recently_ok(dc) {
+        None
+    } else {
+        let lock = CF_DIAL_LOCKS.lock().entry(dc).or_default().clone();
+        Some(lock.lock_owned().await)
+    };
+    let ws = cfproxy_acquire_inner(label, dc, is_media).await;
+    if ws.is_some() {
+        CF_LAST_OK.lock().insert(dc, now_monotonic());
+    }
+    ws
+}
+
+async fn cfproxy_acquire_inner(label: &str, dc: i32, is_media: bool) -> Option<RawWebSocket> {
     let candidates: Vec<(String, String)> = crate::balancer::BALANCER
         .read()
         .get_domains_for_dc(dc)
@@ -1472,7 +1563,68 @@ async fn read_proxy_protocol_line(conn: &mut TcpStream) -> Option<String> {
     }
 }
 
-pub async fn handle_client(pools: Arc<ProxyPools>, mut conn: TcpStream, cancel_token: CancellationToken) {
+/// Сколько секунд после подключения следить, не ушёл ли Telegram, пока мы
+/// ещё дозваниваемся до Telegram/Cloudflare.
+const CLIENT_SETUP_WATCH: Duration = Duration::from_secs(25);
+
+/// Порт client_setup оригинала (13d764f «Socket occupation fix»), реализация
+/// по мотивам Alexingin/tg-ws-proxy-android: Telegram часто бросает соединение,
+/// не дождавшись маршрута (сменил сеть, переподключился). Если клиент закрыл
+/// сокет, пока мы дозваниваемся, дозвон отменяется — не держим сокеты зря и
+/// не плодим сотни висящих попыток. Слежение событийное (epoll RDHUP по dup
+/// сокета), без опроса.
+#[cfg(unix)]
+fn spawn_client_watch(conn: &TcpStream, gone: CancellationToken, stop: CancellationToken) {
+    use tokio::io::unix::AsyncFd;
+    use tokio::io::Interest;
+    let dup = match socket2::SockRef::from(conn).try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    tokio::spawn(async move {
+        let afd = match AsyncFd::with_interest(dup, Interest::READABLE) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let deadline = tokio::time::sleep(CLIENT_SETUP_WATCH);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = &mut deadline => return,
+                r = afd.readable() => {
+                    let mut guard = match r {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    if guard.ready().is_read_closed() {
+                        gone.cancel();
+                        return;
+                    }
+                    guard.clear_ready();
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_client_watch(_conn: &TcpStream, _gone: CancellationToken, _stop: CancellationToken) {}
+
+pub async fn handle_client(pools: Arc<ProxyPools>, conn: TcpStream, cancel_token: CancellationToken) {
+    let gone = CancellationToken::new();
+    let watch_stop = CancellationToken::new();
+    spawn_client_watch(&conn, gone.clone(), watch_stop.clone());
+    let _watch_guard = watch_stop.drop_guard();
+    tokio::select! {
+        _ = handle_client_inner(pools, conn, cancel_token) => {}
+        _ = gone.cancelled() => {
+            ldebug!("client closed the connection before the route was ready; dial cancelled");
+        }
+    }
+}
+
+async fn handle_client_inner(pools: Arc<ProxyPools>, mut conn: TcpStream, cancel_token: CancellationToken) {
     STATS.connections_total.fetch_add(1, Ordering::Relaxed);
     STATS.connections_active.fetch_add(1, Ordering::Relaxed);
     struct ActiveGuard;
@@ -1728,7 +1880,7 @@ async fn serve_core<R, W>(
         Some(ws) => ws,
         None => {
             linfo!("[{}] DC{}{} WS pool unavailable -> fallback", label, dc, m_tag);
-            let splitter = MsgSplitter::new(&relay_init, proto);
+            let splitter = MsgSplitter::new(proto);
             let ok = do_fallback(
                 pools,
                 conn_read,
@@ -1754,11 +1906,56 @@ async fn serve_core<R, W>(
 
     linfo!("[{}] DC{}{} -> WS pool hit", label, dc, m_tag);
     STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
-    let splitter = MsgSplitter::new(&relay_init, proto);
+    let splitter = MsgSplitter::new(proto);
     if splitter.is_some() {
         ldebug!("[{}] MsgSplitter activated for proto 0x{:08X}", label, proto);
     }
     bridge_ws(conn_read, conn_write, ws, label, dc, is_media, splitter, ctx, cancel_token).await;
+}
+
+// ---------------------------------------------------------------------------
+// Поколения клиентских сессий: смена сети (Wi-Fi <-> LTE) закрывает все
+// активные сессии разом — их сокеты привязаны к старой сети и иначе висели бы
+// до таймаута, а Telegram сразу переподключится по новой.
+// ---------------------------------------------------------------------------
+
+static SESSIONS: once_cell::sync::Lazy<SyncMutex<Option<CancellationToken>>> =
+    once_cell::sync::Lazy::new(|| SyncMutex::new(None));
+
+fn session_token(root: &CancellationToken) -> CancellationToken {
+    let mut current = SESSIONS.lock();
+    match current.as_ref() {
+        Some(gen) if !gen.is_cancelled() => gen.child_token(),
+        _ => {
+            let gen = root.child_token();
+            *current = Some(gen.clone());
+            gen.child_token()
+        }
+    }
+}
+
+/// Закрыть все активные клиентские сессии (новые получат новое поколение).
+pub fn drop_active_sessions() -> usize {
+    match SESSIONS.lock().take() {
+        Some(gen) => {
+            gen.cancel();
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Сброс накопленных пауз маршрутов. `network_switched` — сеть сменилась:
+/// тогда забываем и то, что «работало лучше» (TLS/HTTP, fronting, 429 CF).
+pub fn reset_route_state(pools: &ProxyPools, network_switched: bool) {
+    reset_tcp_backoff();
+    pools.reset_backoff();
+    crate::cfproxy::clear_cf_cooldowns(network_switched);
+    if network_switched {
+        reset_cf_dial_state();
+        TRY_FRONTING_FIRST.store(false, Ordering::Relaxed);
+        crate::cfproxy::clear_cfproxy_429_cooldowns();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1852,7 +2049,7 @@ pub async fn run_proxy(
         });
     }
 
-    pools.warmup();
+    pools.warmup(true);
 
     let cancel_stats = cancel_root.clone();
     tokio::spawn(async move {
@@ -1877,7 +2074,7 @@ pub async fn run_proxy(
             Ok((conn, _)) => {
                 accept_errors = 0;
                 let p = pools.clone();
-                let cancel = cancel_root.child_token();
+                let cancel = session_token(&cancel_root);
                 tokio::spawn(async move {
                     // Остановка прокси обрывает и клиентов на стадии handshake.
                     let stop = cancel.clone();

@@ -12,7 +12,9 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::time::Instant;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -102,6 +104,155 @@ static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
 static TLS_CONFIG_FRONTING: Lazy<Arc<ClientConfig>> = Lazy::new(|| TLS_CONFIG.clone());
 
 // ---------------------------------------------------------------------------
+// DpiStream — TCP-поток, который режет первый пакет для обхода DPI
+// (идея из pvtarget-glitch/tg-ws-proxy-android, сборка после блокировки
+// CF-доменов 16.11.2026). TLS: первый рекорд ClientHello делится на два
+// рекорда посередине SNI и уходит двумя сегментами; для сервера это штатная
+// фрагментация TLS (RFC 8446 §5.1), Cloudflare её принимает. HTTP (порт 80):
+// запрос делится внутри значения Host. Простой DPI разбирает только первый
+// рекорд/сегмент и не видит имя целиком. Включается только для CF-маршрутов.
+// ---------------------------------------------------------------------------
+
+pub static CF_DPI_SPLIT: AtomicBool = AtomicBool::new(true);
+
+enum SplitMode {
+    Off,
+    TlsSni(Vec<u8>),
+    HttpHost,
+}
+
+pub struct DpiStream {
+    inner: TcpStream,
+    split: SplitMode,
+    queue: std::collections::VecDeque<(Vec<u8>, usize)>,
+}
+
+impl DpiStream {
+    fn new(inner: TcpStream, split: SplitMode) -> Self {
+        DpiStream {
+            inner,
+            split,
+            queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while let Some((chunk, off)) = self.queue.front_mut() {
+            while *off < chunk.len() {
+                match Pin::new(&mut self.inner).poll_write(cx, &chunk[*off..]) {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                    Poll::Ready(Ok(n)) => *off += n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            self.queue.pop_front();
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Делит первый TLS handshake-рекорд из `buf` на два рекорда (разрез внутри
+/// SNI). None — в начале буфера нет целого handshake-рекорда.
+pub fn split_tls_record(buf: &[u8], sni: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if buf.len() < 6 || buf[0] != 0x16 || buf[1] != 0x03 {
+        return None;
+    }
+    let len = ((buf[3] as usize) << 8) | buf[4] as usize;
+    if len < 2 || buf.len() < 5 + len {
+        return None;
+    }
+    let payload = &buf[5..5 + len];
+    let at = if sni.is_empty() {
+        None
+    } else {
+        payload.windows(sni.len()).position(|w| w == sni)
+    };
+    let cut = match at {
+        Some(pos) => pos + 1 + sni.len() / 2,
+        None => 1,
+    }
+    .clamp(1, len - 1);
+    let record = |part: &[u8]| {
+        let mut v = Vec::with_capacity(5 + part.len());
+        v.extend_from_slice(&[buf[0], buf[1], buf[2], (part.len() >> 8) as u8, part.len() as u8]);
+        v.extend_from_slice(part);
+        v
+    };
+    let mut out = vec![record(&payload[..cut]), record(&payload[cut..])];
+    if buf.len() > 5 + len {
+        out.push(buf[5 + len..].to_vec());
+    }
+    Some(out)
+}
+
+/// Делит HTTP-запрос на два куска внутри значения заголовка Host.
+pub fn split_http_request(req: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let needle = b"\r\nHost: ";
+    let pos = req.windows(needle.len()).position(|w| w == needle)?;
+    let cut = pos + needle.len() + 2;
+    if cut >= req.len() {
+        return None;
+    }
+    Some(vec![req[..cut].to_vec(), req[cut..].to_vec()])
+}
+
+impl AsyncRead for DpiStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        // Хвост первого пакета должен уйти раньше, чем мы начнём ждать ответ.
+        if !this.queue.is_empty() {
+            if let Poll::Ready(Err(e)) = this.poll_drain(cx) {
+                return Poll::Ready(Err(e));
+            }
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DpiStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match this.poll_drain(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        let parts = match std::mem::replace(&mut this.split, SplitMode::Off) {
+            SplitMode::Off => None,
+            SplitMode::TlsSni(sni) => split_tls_record(buf, &sni),
+            SplitMode::HttpHost => split_http_request(buf),
+        };
+        if let Some(parts) = parts {
+            for part in parts {
+                this.queue.push_back((part, 0));
+            }
+            if let Poll::Ready(Err(e)) = this.poll_drain(cx) {
+                return Poll::Ready(Err(e));
+            }
+            return Poll::Ready(Ok(buf.len()));
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_drain(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_flush(cx),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.poll_drain(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_shutdown(cx),
+            other => other,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WsHandshakeError
 // ---------------------------------------------------------------------------
 
@@ -188,13 +339,13 @@ impl From<std::io::Error> for WsError {
 // ---------------------------------------------------------------------------
 
 enum WsReader {
-    Tls(BufReader<tokio::io::ReadHalf<TlsStream<TcpStream>>>),
-    Plain(BufReader<tokio::io::ReadHalf<TcpStream>>),
+    Tls(BufReader<tokio::io::ReadHalf<TlsStream<DpiStream>>>),
+    Plain(BufReader<tokio::io::ReadHalf<DpiStream>>),
 }
 
 enum WsWriter {
-    Tls(tokio::io::WriteHalf<TlsStream<TcpStream>>),
-    Plain(tokio::io::WriteHalf<TcpStream>),
+    Tls(tokio::io::WriteHalf<TlsStream<DpiStream>>),
+    Plain(tokio::io::WriteHalf<DpiStream>),
 }
 
 pub struct RawWebSocket {
@@ -257,6 +408,17 @@ impl RawWebSocket {
         }
         let frame = build_frame(OP_BINARY, data, true);
         self.write_frame(&frame, WS_WRITE_TIMEOUT).await
+    }
+
+    /// Отправка заранее собранных фреймов (см. [`append_frame`]) одной записью.
+    pub async fn send_raw_frames(&self, frames: &[u8]) -> Result<(), WsError> {
+        if self.is_closed() {
+            return Err(WsError::Other("WebSocket closed".to_string()));
+        }
+        if frames.is_empty() {
+            return Ok(());
+        }
+        self.write_frame(frames, WS_WRITE_TIMEOUT).await
     }
 
     pub async fn send_batch(&self, parts: &[Vec<u8>]) -> Result<(), WsError> {
@@ -548,6 +710,29 @@ fn parse_close(payload: &[u8]) -> (Option<u16>, String) {
 // Frame builder (mask=true всегда для клиента)
 // ---------------------------------------------------------------------------
 
+/// Дописывает в `out` готовый WS-фрейм (FIN, клиентская маска). Несколько
+/// фреймов в одном буфере уходят одной записью и укладываются в общие
+/// TLS-записи, а не по записи на каждый мелкий MTProto-пакет.
+pub fn append_frame(out: &mut Vec<u8>, opcode: u8, data: &[u8]) {
+    let length = data.len();
+    out.push(0x80 | opcode);
+    if length < 126 {
+        out.push(0x80 | length as u8);
+    } else if length < 65536 {
+        out.push(0x80 | 126);
+        out.extend_from_slice(&(length as u16).to_be_bytes());
+    } else {
+        out.push(0x80 | 127);
+        out.extend_from_slice(&(length as u64).to_be_bytes());
+    }
+    let mut mask_key = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut mask_key);
+    out.extend_from_slice(&mask_key);
+    let start = out.len();
+    out.extend_from_slice(data);
+    xor_mask_in_place(&mut out[start..], &mask_key);
+}
+
 pub fn build_frame(opcode: u8, data: &[u8], mask: bool) -> Vec<u8> {
     let length = data.len();
     let fb = 0x80 | opcode;
@@ -623,7 +808,12 @@ fn set_sock_opts(stream: &TcpStream) {
     }
     // Аналог Go/Python: keepalive 30s — детект мёртвых соединений на мобиле.
     let sock = socket2::SockRef::from(stream);
-    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+    // Мёртвый пир (смена сети, NAT) обнаруживается за ~60 с, а не за ~11 мин
+    // с системными интервалами Linux по умолчанию.
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(3);
     let _ = sock.set_tcp_keepalive(&ka);
     // proxy/raw_websocket.py::set_sock_opts — buffer_size из конфига.
     let buf = BUFFER_SIZE.load(std::sync::atomic::Ordering::Relaxed);
@@ -759,7 +949,7 @@ async fn read_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String, Ws
 /// TCP-подключение с приоритетом IPv4. Резолвер Android часто отдаёт IPv6
 /// первым, а до Cloudflare по IPv6 TCP поднимается, но TLS виснет
 /// (Flowseal/tg-ws-proxy#1695). IP-литералы подключаются как есть.
-async fn connect_tcp_ipv4_first(dial_addr: &str, port: u16) -> std::io::Result<TcpStream> {
+pub(crate) async fn connect_tcp_ipv4_first(dial_addr: &str, port: u16) -> std::io::Result<TcpStream> {
     if let Ok(ip) = dial_addr.parse::<IpAddr>() {
         return TcpStream::connect((ip, port)).await;
     }
@@ -790,6 +980,7 @@ pub async fn ws_connect_once_full(
     timeout: Duration,
     sni: Option<&str>,
     secure: bool,
+    dpi_split: bool,
 ) -> Result<RawWebSocket, WsError> {
     let dial_addr = dial_addr.trim();
     if dial_addr.is_empty() {
@@ -811,7 +1002,8 @@ pub async fn ws_connect_once_full(
     let probe = socket2::SockRef::from(&raw_conn).try_clone().ok();
 
     if !secure {
-        let (read_half, write_half) = tokio::io::split(raw_conn);
+        let stream = DpiStream::new(raw_conn, if dpi_split { SplitMode::HttpHost } else { SplitMode::Off });
+        let (read_half, write_half) = tokio::io::split(stream);
         let (reader, writer) = ws_upgrade(read_half, write_half, domain, path, deadline).await?;
         return Ok(RawWebSocket {
             reader: tokio::sync::Mutex::new(WsReader::Plain(reader)),
@@ -829,8 +1021,13 @@ pub async fn ws_connect_once_full(
         TLS_CONFIG.clone()
     };
     let connector = TlsConnector::from(cfg);
-    let sni_server = server_name(sni.unwrap_or(domain));
-    let tls_conn = match tokio::time::timeout_at(deadline, connector.connect(sni_server, raw_conn)).await {
+    let sni_name = sni.unwrap_or(domain);
+    let sni_server = server_name(sni_name);
+    let stream = DpiStream::new(
+        raw_conn,
+        if dpi_split { SplitMode::TlsSni(sni_name.as_bytes().to_vec()) } else { SplitMode::Off },
+    );
+    let tls_conn = match tokio::time::timeout_at(deadline, connector.connect(sni_server, stream)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             if e.kind() != std::io::ErrorKind::ConnectionReset {
@@ -863,6 +1060,7 @@ pub async fn ws_connect_full_opts(
     timeout: f64,
     sni: Option<&str>,
     secure_opt: Option<bool>,
+    dpi_split: bool,
 ) -> Result<RawWebSocket, WsError> {
     let path = if path.is_empty() { WS_PATH } else { path };
     let total = ws_connect_timeout(timeout);
@@ -875,7 +1073,7 @@ pub async fn ws_connect_full_opts(
         ip.trim().to_string()
     };
 
-    let first = ws_connect_once_full(&primary_addr, domain, path, total, sni, secure).await;
+    let first = ws_connect_once_full(&primary_addr, domain, path, total, sni, secure, dpi_split).await;
     let err = match first {
         Ok(ws) => return Ok(ws),
         Err(e) => e,
@@ -898,13 +1096,13 @@ pub async fn ws_connect_full_opts(
         return Err(WsError::Timeout);
     }
     ldebug!("WS {}: system DNS failed, retry via DoH -> {}", domain, resolved);
-    ws_connect_once_full(&resolved, domain, path, remaining, sni, secure).await
+    ws_connect_once_full(&resolved, domain, path, remaining, sni, secure, dpi_split).await
 }
 
 /// WS поверх уже подключённого plain-TCP (тесты и отладка без 80/443).
 pub async fn ws_upgrade_plain(conn: TcpStream, domain: &str, path: &str, timeout: Duration) -> Result<RawWebSocket, WsError> {
     let probe = socket2::SockRef::from(&conn).try_clone().ok();
-    let (r, w) = tokio::io::split(conn);
+    let (r, w) = tokio::io::split(DpiStream::new(conn, SplitMode::Off));
     let (reader, writer) = ws_upgrade(r, w, domain, path, Instant::now() + timeout).await?;
     Ok(RawWebSocket {
         reader: tokio::sync::Mutex::new(WsReader::Plain(reader)),
@@ -954,7 +1152,7 @@ mod tests {
         // напрямую поверх уже подключённого сокета.
         let conn = TcpStream::connect(addr).await.unwrap();
         let probe = socket2::SockRef::from(&conn).try_clone().ok();
-        let (r, w) = tokio::io::split(conn);
+        let (r, w) = tokio::io::split(DpiStream::new(conn, SplitMode::Off));
         let deadline = Instant::now() + Duration::from_secs(5);
         let (reader, writer) = ws_upgrade(r, w, "example.org", "/apiws", deadline).await.unwrap();
         let ws = RawWebSocket {
@@ -989,7 +1187,7 @@ mod tests {
         ));
         let conn = TcpStream::connect(addr).await.unwrap();
         let probe = socket2::SockRef::from(&conn).try_clone().ok();
-        let (r, w) = tokio::io::split(conn);
+        let (r, w) = tokio::io::split(DpiStream::new(conn, SplitMode::Off));
         let deadline = Instant::now() + Duration::from_secs(5);
         let (reader, writer) = ws_upgrade(r, w, "example.org", "/apiws", deadline).await.unwrap();
         let ws = RawWebSocket {
@@ -1003,6 +1201,59 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!ws.is_stale());
         server.abort();
+    }
+
+    #[test]
+    fn tls_record_split_cuts_inside_sni() {
+        let sni = b"kws2.example.com";
+        let mut body = vec![0x01, 0x00, 0x00, 0x40, 0x03, 0x03];
+        body.extend_from_slice(&[0xAA; 20]);
+        body.extend_from_slice(sni);
+        body.extend_from_slice(&[0xBB; 10]);
+        let mut rec = vec![0x16, 0x03, 0x01, 0x00, body.len() as u8];
+        rec.extend_from_slice(&body);
+        rec.extend_from_slice(b"tail");
+        let parts = split_tls_record(&rec, sni).unwrap();
+        assert_eq!(parts.len(), 3);
+        // Оба рекорда — handshake, вместе дают исходное тело; SNI разрезан.
+        let (a, b) = (&parts[0], &parts[1]);
+        assert_eq!((a[0], b[0]), (0x16, 0x16));
+        assert_eq!(a.len() - 5 + b.len() - 5, body.len());
+        let joined = [&a[5..], &b[5..]].concat();
+        assert_eq!(joined, body);
+        assert!(!a.windows(sni.len()).any(|w| w == sni) && !b.windows(sni.len()).any(|w| w == sni));
+        assert_eq!(parts[2], b"tail");
+        assert!(split_tls_record(b"GET / HTTP/1.1", sni).is_none());
+        assert!(split_tls_record(&rec[..10], sni).is_none());
+    }
+
+    #[test]
+    fn http_request_split_cuts_inside_host() {
+        let req = b"GET /apiws HTTP/1.1\r\nHost: kws2.example.com\r\nUpgrade: websocket\r\n\r\n";
+        let parts = split_http_request(req).unwrap();
+        assert_eq!(parts.concat(), req.to_vec());
+        assert!(parts[0].ends_with(b"Host: kw"));
+        assert!(split_http_request(b"GET / HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    #[tokio::test]
+    async fn dpi_stream_sends_split_parts_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut got = Vec::new();
+            sock.read_to_end(&mut got).await.unwrap();
+            got
+        });
+        let conn = TcpStream::connect(addr).await.unwrap();
+        let mut s = DpiStream::new(conn, SplitMode::HttpHost);
+        let req = b"GET / HTTP/1.1\r\nHost: example.org\r\n\r\n";
+        s.write_all(req).await.unwrap();
+        s.write_all(b"after").await.unwrap();
+        s.shutdown().await.unwrap();
+        drop(s);
+        assert_eq!(server.await.unwrap(), [&req[..], b"after"].concat());
     }
 
     #[tokio::test]
@@ -1027,7 +1278,7 @@ mod tests {
             true,
         ));
         let conn = TcpStream::connect(addr).await.unwrap();
-        let (r, w) = tokio::io::split(conn);
+        let (r, w) = tokio::io::split(DpiStream::new(conn, SplitMode::Off));
         let deadline = Instant::now() + Duration::from_secs(5);
         match ws_upgrade(r, w, "example.org", "/apiws", deadline).await {
             Err(WsError::Handshake(h)) => {

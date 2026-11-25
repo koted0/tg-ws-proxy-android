@@ -1,24 +1,24 @@
+pub mod balancer;
 pub mod cfproxy;
 pub mod config;
 pub mod crypto;
 pub mod faketls;
+pub mod https;
+mod jni_api;
 pub mod proxy;
 pub mod ws;
-pub mod balancer;
 
 use config::*;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use proxy::{parse_cidr_pool, run_proxy, ProxyPools};
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
-// Глобальный рантайм — никогда не дропается
+// Глобальный рантайм — никогда не дропается.
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 
 struct ProxyState {
@@ -35,7 +35,6 @@ fn state_cell() -> &'static Mutex<Option<ProxyState>> {
 
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
-        // Многопоточный рантайм, кол-во воркеров адекватно мобиле
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .thread_name("tgwsproxy-rt")
@@ -45,75 +44,65 @@ fn runtime() -> &'static Runtime {
     })
 }
 
-fn cstr_to_string(p: *const c_char) -> String {
-    if p.is_null() {
-        return String::new();
-    }
-    unsafe { CStr::from_ptr(p).to_string_lossy().into_owned() }
+fn current_pools() -> Option<Arc<ProxyPools>> {
+    state_cell().lock().as_ref().map(|s| s.pools.clone())
+}
+
+/// Паника в Rust-коде пишется в лог приложения, а не теряется молча.
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            lerror!("panic: {}", info);
+            default(info);
+        }));
+    });
+}
+
+/// Барьер на границе FFI: паника не уходит в JVM (это UB/abort), а
+/// превращается в значение по умолчанию. Паники внутри задач tokio и так
+/// гасятся рантаймом — падает одно соединение, а не приложение.
+pub(crate) fn guarded<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(fallback)
 }
 
 // ---------------------------------------------------------------------------
-// Exports
+// API ядра (вызывается из JNI, см. jni_api.rs)
 // ---------------------------------------------------------------------------
 
-/// # Safety
-/// Указатели должны быть валидными C-строками (или null).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn StartProxy(
-    c_host: *const c_char,
-    port: c_int,
-    c_dc_ips: *const c_char,
-    c_secret: *const c_char,
-    verbose: c_int,
-) -> c_int {
-    let cell = state_cell();
-    let mut guard = cell.lock();
-
+/// 0 — слушает; -1 — уже запущен; -3 — не удалось занять порт.
+pub fn start_proxy(host: &str, port: u16, dc_ips: &str, secret: &str, verbose: bool) -> i32 {
+    install_panic_hook();
+    let mut guard = state_cell().lock();
     if guard.is_some() {
         return -1;
     }
 
-    let host = cstr_to_string(c_host);
-    let go_port = port as u16;
-    let dc_ips_str = cstr_to_string(c_dc_ips);
-    let secret_str = cstr_to_string(c_secret);
-    let is_verbose = verbose != 0;
-
-    init_logging(is_verbose);
+    init_logging(verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
-
-    if secret_str.len() == 32 {
-        if hex::decode(&secret_str).is_ok() {
-            *PROXY_SECRET.write() = secret_str.clone();
-        }
+    if secret.len() == 32 && hex::decode(secret).is_ok() {
+        *PROXY_SECRET.write() = secret.to_string();
     }
-
     cfproxy::init_cfproxy_domains();
+    NET_AVAILABLE.store(true, Ordering::Relaxed);
 
-    let dc_opt_map: HashMap<i32, String> = parse_cidr_pool(&dc_ips_str);
-
+    let dc_opt_map: HashMap<i32, String> = parse_cidr_pool(dc_ips);
     let rt = runtime();
     let cancel_tasks = CancellationToken::new();
     let pools = Arc::new(ProxyPools::new(cancel_tasks.clone()));
 
-    // Канал готовности: ждём успешного bind перед возвратом
+    // Ждём результат bind перед возвратом, чтобы UI знал, слушает ли прокси.
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
     let pools_task = pools.clone();
-    let host_task = host.clone();
-    let map_task = dc_opt_map.clone();
+    let host_task = host.to_string();
     let cancel_root = cancel_tasks.clone();
-
     let handle = rt.spawn(async move {
-        // Предварительный bind для сигнала готовности (кортеж — чтобы IPv6
-        // адрес без скобок тоже работал).
-        let addr = format!("{}:{}", host_task, go_port);
-        match tokio::net::TcpListener::bind((host_task.as_str(), go_port)).await {
+        let addr = format!("{}:{}", host_task, port);
+        match tokio::net::TcpListener::bind((host_task.as_str(), port)).await {
             Ok(listener) => {
                 let _ = tx.send(Ok(()));
-                if let Err(e) =
-                    run_proxy(pools_task, host_task, go_port, map_task, cancel_root, listener).await
-                {
+                if let Err(e) = run_proxy(pools_task, host_task, port, dc_opt_map, cancel_root, listener).await {
                     lerror!("listen on {}: {}", addr, e);
                 }
             }
@@ -124,46 +113,34 @@ pub unsafe extern "C" fn StartProxy(
         }
     });
 
-    // Ждём результат bind
     match rx.recv() {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            handle.abort();
-            return -3;
-        }
-        Err(_) => {
+        _ => {
             handle.abort();
             return -3;
         }
     }
-
     *guard = Some(ProxyState {
         pools,
         handle,
         cancel_tasks,
     });
-
     0
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn StopProxy() -> c_int {
-    let cell = state_cell();
-    let mut guard = cell.lock();
-
+pub fn stop_proxy() -> i32 {
+    let mut guard = state_cell().lock();
     let state = match guard.take() {
         Some(s) => s,
         None => return -1,
     };
 
-    // graceful shutdown — НЕ дропаем рантайм
+    // graceful shutdown — рантайм не дропаем
     linfo!("StopProxy: cancelling all tasks");
     state.cancel_tasks.cancel();
-
-    let rt = runtime();
     let pools = state.pools.clone();
     let handle = state.handle;
-    rt.block_on(async move {
+    runtime().block_on(async move {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         pools.reset();
         // Даём закрыться WS из пула до возможного повторного StartProxy.
@@ -174,145 +151,129 @@ pub extern "C" fn StopProxy() -> c_int {
     cfproxy::clear_cfproxy_429_cooldowns();
     cfproxy::reset_cf_timeouts();
     proxy::reset_tcp_backoff();
-
+    proxy::reset_cf_dial_state();
+    proxy::drop_active_sessions();
     linfo!("StopProxy: exit");
     0
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SetPoolSize(size: c_int) {
-    // Оригинал: pool_size = max(0, N); 0 отключает преконнект пула.
-    let mut n = size;
-    if n < 0 {
-        n = 0;
-    }
-    if n > 16 {
-        n = 16;
-    }
-    POOL_SIZE.store(n, Ordering::Relaxed);
+pub fn set_pool_size(size: i32) {
+    // pool_size = max(0, N); 0 отключает прямые WS (как в оригинале).
+    POOL_SIZE.store(size.clamp(0, 16), Ordering::Relaxed);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SetBufferSizeKb(kb: c_int) {
-    // proxy --buf-kb: размер SO_RCVBUF/SO_SNDBUF, минимум 4KB.
-    let mut n = kb;
-    if n < 4 {
-        n = 4;
-    }
-    if n > 4096 {
-        n = 4096;
-    }
-    BUFFER_SIZE.store(n * 1024, Ordering::Relaxed);
-    RECV_BUF.store(n * 1024, Ordering::Relaxed);
-    SEND_BUF.store(n * 1024, Ordering::Relaxed);
+pub fn set_buffer_size_kb(kb: i32) {
+    let n = kb.clamp(4, 4096) * 1024;
+    BUFFER_SIZE.store(n, Ordering::Relaxed);
+    RECV_BUF.store(n, Ordering::Relaxed);
+    SEND_BUF.store(n, Ordering::Relaxed);
 }
 
-/// # Safety
-/// `c_cache_dir` — валидная C-строка или null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn SetCfProxyCacheDir(c_cache_dir: *const c_char) {
-    let dir = cstr_to_string(c_cache_dir);
+pub fn set_cfproxy_cache_dir(dir: &str) {
     CFPROXY.write().cache_dir = dir.trim().to_string();
 }
 
-/// # Safety
-/// `c_user_domain` — валидная C-строка или null (можно списком через , ; пробел).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn SetCfProxyConfig(
-    enabled: c_int,
-    _priority: c_int,
-    c_user_domain: *const c_char,
-) {
-    CFPROXY_ENABLED.store(enabled != 0, Ordering::Relaxed);
-    let user_domain = cstr_to_string(c_user_domain);
-    // Поддержка нескольких доменов как --cfproxy-domain (repeatable).
-    let list = coerce_domain_list_str(&user_domain);
+/// `user_domain` — свои домены CF proxy через `,` `;` или пробел.
+pub fn set_cfproxy_config(enabled: bool, user_domain: &str) {
+    CFPROXY_ENABLED.store(enabled, Ordering::Relaxed);
+    let list = coerce_domain_list_str(user_domain);
     let mut cfg = CFPROXY.write();
     cfg.user_domain = user_domain.trim().to_string();
     if !list.is_empty() {
         cfg.domains = list.clone();
         cfg.active = list[0].clone();
-        crate::balancer::BALANCER
-            .write()
-            .update_domains_list(&cfg.domains);
+        balancer::BALANCER.write().update_domains_list(&cfg.domains);
     }
 }
 
-/// # Safety
-/// `c_domains` — валидная C-строка или null (--cfproxy-worker-domain, repeatable).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn SetCfWorkerDomains(c_domains: *const c_char) {
-    let raw = cstr_to_string(c_domains);
-    *CF_WORKER_DOMAINS.write() = coerce_domain_list_str(&raw);
+pub fn set_cf_worker_domains(raw: &str) {
+    *CF_WORKER_DOMAINS.write() = coerce_domain_list_str(raw);
 }
 
-/// # Safety
-/// `c_domain` — валидная C-строка или null (--fake-tls-domain, ee-secret).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn SetFakeTlsDomain(c_domain: *const c_char) {
-    let d = cstr_to_string(c_domain);
-    *FAKE_TLS_DOMAIN.write() = d.trim().to_string();
+pub fn set_fake_tls_domain(domain: &str) {
+    *FAKE_TLS_DOMAIN.write() = domain.trim().to_string();
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SetDisableSecure(v: c_int) {
-    // --no-secure: порт 80 для CF proxy/worker.
-    DISABLE_SECURE.store(v != 0, Ordering::Relaxed);
+pub fn set_disable_secure(v: bool) {
+    DISABLE_SECURE.store(v, Ordering::Relaxed);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SetForceTestDc(v: c_int) {
-    // --force-test-dc: весь трафик на тестовые DC.
-    FORCE_TEST_DC.store(v != 0, Ordering::Relaxed);
+pub fn set_force_test_dc(v: bool) {
+    FORCE_TEST_DC.store(v, Ordering::Relaxed);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SetProxyProtocol(v: c_int) {
-    // --proxy-protocol: принимать PROXY protocol v1.
-    PROXY_PROTOCOL.store(v != 0, Ordering::Relaxed);
+pub fn set_proxy_protocol(v: bool) {
+    PROXY_PROTOCOL.store(v, Ordering::Relaxed);
 }
 
-/// # Safety
-/// `c_secret` — валидная C-строка или null.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn SetSecret(c_secret: *const c_char) {
-    let s = cstr_to_string(c_secret);
-    if s.len() != 32 {
-        return;
-    }
-    if hex::decode(&s).is_err() {
-        return;
-    }
-    *PROXY_SECRET.write() = s;
+/// DEBUG-логи можно включать и выключать на лету (без перезапуска прокси).
+pub fn set_verbose(v: bool) {
+    LOG_VERBOSE.store(v, Ordering::Relaxed);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn GetStats() -> *mut c_char {
-    let s = STATS.summary();
-    CString::new(s).unwrap_or_default().into_raw()
+pub fn stats_summary() -> String {
+    STATS.summary()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn GetSecretWithPrefix() -> *mut c_char {
-    // ee-secret при включённом FakeTLS: ee{secret}{domain_hex} — как в оригинале.
+/// ee-secret при включённом FakeTLS: ee{secret}{domain_hex}, иначе dd{secret}.
+pub fn secret_with_prefix() -> String {
     let sec = PROXY_SECRET.read().clone();
     let ftls = FAKE_TLS_DOMAIN.read().clone();
-    let full = if ftls.is_empty() {
+    if ftls.is_empty() {
         format!("dd{}", sec)
     } else {
-        format!("ee{}{}", sec, ftls.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>())
-    };
-    CString::new(full).unwrap_or_default().into_raw()
+        format!("ee{}{}", sec, hex::encode(ftls.as_bytes()))
+    }
 }
 
-/// # Safety
-/// `p` должен быть указателем, ранее возвращённым из этой библиотеки.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn FreeString(p: *mut c_char) {
-    if p.is_null() {
+/// Сеть пропала/появилась (ConnectivityManager). Пока её нет, провалы не
+/// копятся в паузах маршрутов; при появлении паузы сбрасываются.
+pub fn set_network_available(available: bool) {
+    let was = NET_AVAILABLE.swap(available, Ordering::Relaxed);
+    if was == available {
         return;
     }
-    unsafe {
-        let _ = CString::from_raw(p);
+    if !available {
+        linfo!("Network lost: route failures are not counted until it is back");
+        return;
     }
+    linfo!("Network is back: resetting route pauses");
+    if let Some(pools) = current_pools() {
+        runtime().spawn(async move {
+            proxy::reset_route_state(&pools, false);
+            pools.warmup(false);
+        });
+    }
+}
+
+/// Сменилась сеть по умолчанию (Wi-Fi <-> LTE): сокеты старой сети мертвы.
+/// Закрываем активные сессии и пул, забываем паузы и выученные режимы.
+pub fn network_changed() -> i32 {
+    NET_AVAILABLE.store(true, Ordering::Relaxed);
+    let pools = match current_pools() {
+        Some(p) => p,
+        None => return -1,
+    };
+    linfo!("Network changed: closing old sessions and resetting routes");
+    proxy::drop_active_sessions();
+    runtime().spawn(async move {
+        pools.reset();
+        proxy::reset_route_state(&pools, true);
+        pools.warmup(false);
+    });
+    0
+}
+
+/// Экран включён: снимаем накопленные за время сна паузы и прогреваем пул,
+/// чтобы Telegram подключился сразу, а не после истечения backoff.
+pub fn wake() -> i32 {
+    let pools = match current_pools() {
+        Some(p) => p,
+        None => return -1,
+    };
+    runtime().spawn(async move {
+        proxy::reset_route_state(&pools, false);
+        pools.warmup(false);
+    });
+    0
 }

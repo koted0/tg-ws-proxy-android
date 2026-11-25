@@ -131,4 +131,5 @@
     <string name="cf_custom_domains_hint">example.com, example2.com (пусто — встроенный список)</string>
     <string name="cf_worker_domains">Домены Cloudflare Worker</string>
     <string name="cf_worker_domains_hint">name.username.workers.dev, … (через запятую)</string>
+    <string name="battery_optimization_banner">Android может усыплять прокси при заблокированном экране. Нажмите, чтобы разрешить работу в фоне.</string>
 </resources>

@@ -1,91 +1,54 @@
 package com.amurcanov.tgwsproxy
 
-import com.sun.jna.Library
-import com.sun.jna.Native
-import com.sun.jna.Pointer
-
-interface ProxyLibrary : Library {
-    companion object {
-        val INSTANCE = Native.load("tgwsproxy", ProxyLibrary::class.java) as ProxyLibrary
-    }
-
-    fun StartProxy(host: String, port: Int, dcIps: String, secret: String, verbose: Int): Int
-    fun StopProxy(): Int
-    fun SetPoolSize(size: Int)
-    fun SetBufferSizeKb(kb: Int)
-    fun SetCfProxyCacheDir(cacheDir: String)
-    fun SetCfProxyConfig(enabled: Int, priority: Int, userDomain: String)
-    fun SetCfWorkerDomains(domains: String)
-    fun SetFakeTlsDomain(domain: String)
-    fun SetDisableSecure(v: Int)
-    fun SetForceTestDc(v: Int)
-    fun SetProxyProtocol(v: Int)
-    fun GetSecretWithPrefix(): Pointer?
-    fun GetStats(): Pointer?
-    fun FreeString(p: Pointer)
-}
-
+/**
+ * Мост к нативному ядру (libtgwsproxy.so, Rust) через JNI.
+ *
+ * Раньше здесь был JNA: libjnidispatch.so на каждую ABI и ~110 КБ классов в
+ * dex ради десятка вызовов. Имена `external`-функций должны совпадать с
+ * экспортами `Java_com_amurcanov_tgwsproxy_NativeProxy_*` в src/jni_api.rs.
+ */
 object NativeProxy {
-    fun startProxy(host: String, port: Int, dcIps: String, secret: String, verbose: Int): Int {
-        return ProxyLibrary.INSTANCE.StartProxy(host, port, dcIps, secret, verbose)
+    init {
+        System.loadLibrary("tgwsproxy")
     }
 
-    fun stopProxy(): Int {
-        return ProxyLibrary.INSTANCE.StopProxy()
-    }
+    @JvmStatic external fun startProxy(host: String, port: Int, dcIps: String, secret: String, verbose: Int): Int
+    @JvmStatic external fun stopProxy(): Int
+    @JvmStatic external fun setPoolSize(size: Int)
+    @JvmStatic external fun setBufferSizeKb(kb: Int)
+    @JvmStatic external fun setCfProxyCacheDir(cacheDir: String)
+    @JvmStatic external fun setCfWorkerDomains(domains: String)
+    @JvmStatic external fun setFakeTlsDomain(domain: String)
 
-    fun setPoolSize(size: Int) {
-        ProxyLibrary.INSTANCE.SetPoolSize(size)
-    }
+    /** Полный секрет с префиксом (dd… или ee…+hex домена Fake TLS). */
+    @JvmStatic external fun getSecretWithPrefix(): String?
+    @JvmStatic external fun getStats(): String?
 
-    fun setBufferSizeKb(kb: Int) {
-        ProxyLibrary.INSTANCE.SetBufferSizeKb(kb)
-    }
+    /** Сменилась сеть по умолчанию (Wi-Fi <-> LTE): закрыть старые сессии, сбросить паузы. */
+    @JvmStatic external fun networkChanged(): Int
 
-    fun setCfProxyCacheDir(cacheDir: String) {
-        ProxyLibrary.INSTANCE.SetCfProxyCacheDir(cacheDir)
-    }
+    /** Экран включён: снять накопленные за сон паузы маршрутов и прогреть пул. */
+    @JvmStatic external fun wake(): Int
 
-    fun setCfProxyConfig(enabled: Boolean, priority: Boolean, userDomain: String) {
-        ProxyLibrary.INSTANCE.SetCfProxyConfig(
-            if (enabled) 1 else 0,
-            if (priority) 1 else 0,
-            userDomain
-        )
-    }
+    @JvmStatic private external fun nativeSetCfProxyConfig(enabled: Int, priority: Int, userDomain: String)
+    @JvmStatic private external fun nativeSetDisableSecure(v: Int)
+    @JvmStatic private external fun nativeSetForceTestDc(v: Int)
+    @JvmStatic private external fun nativeSetProxyProtocol(v: Int)
+    @JvmStatic private external fun nativeSetVerbose(v: Int)
+    @JvmStatic private external fun nativeSetNetworkAvailable(v: Int)
 
-    fun setCfWorkerDomains(domains: String) {
-        ProxyLibrary.INSTANCE.SetCfWorkerDomains(domains)
-    }
+    fun setCfProxyConfig(enabled: Boolean, priority: Boolean, userDomain: String) =
+        nativeSetCfProxyConfig(if (enabled) 1 else 0, if (priority) 1 else 0, userDomain)
 
-    fun setFakeTlsDomain(domain: String) {
-        ProxyLibrary.INSTANCE.SetFakeTlsDomain(domain)
-    }
+    fun setDisableSecure(v: Boolean) = nativeSetDisableSecure(if (v) 1 else 0)
 
-    fun setDisableSecure(v: Boolean) {
-        ProxyLibrary.INSTANCE.SetDisableSecure(if (v) 1 else 0)
-    }
+    fun setForceTestDc(v: Boolean) = nativeSetForceTestDc(if (v) 1 else 0)
 
-    fun setForceTestDc(v: Boolean) {
-        ProxyLibrary.INSTANCE.SetForceTestDc(if (v) 1 else 0)
-    }
+    fun setProxyProtocol(v: Boolean) = nativeSetProxyProtocol(if (v) 1 else 0)
 
-    fun setProxyProtocol(v: Boolean) {
-        ProxyLibrary.INSTANCE.SetProxyProtocol(if (v) 1 else 0)
-    }
+    /** DEBUG-логи ядра; переключается на лету, без перезапуска прокси. */
+    fun setVerbose(v: Boolean) = nativeSetVerbose(if (v) 1 else 0)
 
-    /** Returns the full secret with correct prefix (dd or ee+domain_hex) */
-    fun getSecretWithPrefix(): String? {
-        val ptr = ProxyLibrary.INSTANCE.GetSecretWithPrefix() ?: return null
-        val res = ptr.getString(0)
-        ProxyLibrary.INSTANCE.FreeString(ptr)
-        return res
-    }
-
-    fun getStats(): String? {
-        val ptr = ProxyLibrary.INSTANCE.GetStats() ?: return null
-        val res = ptr.getString(0)
-        ProxyLibrary.INSTANCE.FreeString(ptr)
-        return res
-    }
+    /** Есть ли сеть: пока её нет, ядро не записывает провалы в паузы маршрутов. */
+    fun setNetworkAvailable(v: Boolean) = nativeSetNetworkAvailable(if (v) 1 else 0)
 }
