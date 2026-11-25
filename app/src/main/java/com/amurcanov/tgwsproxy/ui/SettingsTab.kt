@@ -92,6 +92,7 @@ fun SettingsTab(settingsStore: SettingsStore) {
     val savedCustomDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
     val savedCfWorkerDomains by settingsStore.cfWorkerDomains.collectAsStateWithLifecycle(initialValue = "")
     val autoStartOnBoot by settingsStore.autoStartOnBoot.collectAsStateWithLifecycle(initialValue = false)
+    val cfH2Media by settingsStore.cfH2Media.collectAsStateWithLifecycle(initialValue = true)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
     if (!isReady) {
@@ -451,6 +452,34 @@ fun SettingsTab(settingsStore: SettingsStore) {
                         scheduleCfSave()
                     }
                 )
+                if (cfEnabled) {
+                    // HTTP/2-транспорт медиа через CF (как в оригинале; --no-h2 выключает).
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                stringResource(com.amurcanov.tgwsproxy.R.string.cf_h2_media),
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                stringResource(com.amurcanov.tgwsproxy.R.string.cf_h2_media_hint),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = cfH2Media,
+                            onCheckedChange = { enabled ->
+                                scope.launch { settingsStore.saveCfH2Media(enabled) }
+                            },
+                            enabled = !isRunning
+                        )
+                    }
+                }
             }
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f))

@@ -977,7 +977,8 @@ pub async fn bridge_ws<R, W>(
     mut splitter: Option<MsgSplitter>,
     ctx: CryptoCtx,
     cancel_token: CancellationToken,
-) where
+) -> SessionStats
+where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
@@ -1140,15 +1141,17 @@ pub async fn bridge_ws<R, W>(
     session.cancel();
     ping_task.abort();
 
+    let stopped = cancel_token.is_cancelled();
     let close_reason = if !down_reason.is_empty() {
         down_reason
     } else if !up_reason.is_empty() {
         up_reason
-    } else if cancel_token.is_cancelled() {
+    } else if stopped {
         "proxy stopped".to_string()
     } else {
         "normal".to_string()
     };
+    let secs = now_monotonic() - start;
     linfo!(
         "[{}] {} WS session closed ({}): ^{} ({} pkts) v{} ({} pkts) in {:.1}s",
         label,
@@ -1158,10 +1161,97 @@ pub async fn bridge_ws<R, W>(
         up_packets,
         human_bytes(down_bytes),
         down_packets,
-        now_monotonic() - start
+        secs
     );
 
     ws.close().await;
+    SessionStats {
+        up_bytes,
+        down_bytes,
+        secs,
+        stopped,
+    }
+}
+
+/// Итог WS-сессии: по нему видно, отвечал ли Telegram вообще.
+pub struct SessionStats {
+    pub up_bytes: i64,
+    pub down_bytes: i64,
+    pub secs: f64,
+    /// Закрыта нами (остановка, смена сети), а не сетью/клиентом.
+    pub stopped: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Пауза прямого пути при «немых» сессиях. В части сетей прямой WS к
+// 149.154.167.220 соединяется, но ответы Telegram не приходят (DPI
+// замораживает поток): пул такого не видит, соединение выглядит живым. Если
+// сессии через прямой путь для DC дважды подряд закрылись без единого байта
+// ответа, прямой путь для этого DC ставится на паузу и трафик идёт через
+// fallback (Cloudflare). Любая сессия с ответом сбрасывает счётчик.
+// ---------------------------------------------------------------------------
+
+const DIRECT_SILENT_MIN_SECS: f64 = 3.0;
+const DIRECT_SILENT_STRIKES: u32 = 2;
+const DIRECT_SILENT_WINDOW: f64 = 180.0;
+const DIRECT_PAUSE_SECS: f64 = 300.0;
+
+#[derive(Default)]
+struct DirectHealth {
+    strikes: u32,
+    first_strike: f64,
+    paused_until: f64,
+}
+
+static DIRECT_HEALTH: once_cell::sync::Lazy<SyncMutex<HashMap<i32, DirectHealth>>> =
+    once_cell::sync::Lazy::new(|| SyncMutex::new(HashMap::new()));
+
+/// Сколько секунд прямой путь для DC ещё на паузе.
+pub fn direct_pause_remaining(dc: i32) -> Option<f64> {
+    let now = now_monotonic();
+    DIRECT_HEALTH
+        .lock()
+        .get(&dc)
+        .map(|h| h.paused_until - now)
+        .filter(|left| *left > 0.0)
+}
+
+pub fn reset_direct_health() {
+    DIRECT_HEALTH.lock().clear();
+}
+
+/// Учесть сессию через прямой WS из пула.
+pub fn record_direct_session(label: &str, dc: i32, s: &SessionStats) {
+    if s.stopped || !should_record_failure(None) {
+        return;
+    }
+    let now = now_monotonic();
+    let mut map = DIRECT_HEALTH.lock();
+    let h = map.entry(dc).or_default();
+    if s.down_bytes > 0 {
+        h.strikes = 0;
+        return;
+    }
+    if s.up_bytes == 0 || s.secs < DIRECT_SILENT_MIN_SECS {
+        return;
+    }
+    if h.strikes == 0 || now - h.first_strike > DIRECT_SILENT_WINDOW {
+        h.strikes = 0;
+        h.first_strike = now;
+    }
+    h.strikes += 1;
+    if h.strikes >= DIRECT_SILENT_STRIKES {
+        h.strikes = 0;
+        h.paused_until = now + DIRECT_PAUSE_SECS;
+        drop(map);
+        lwarn!(
+            "[{}] DC{} direct WS: {} sessions in a row got no reply from Telegram -> direct route paused for {:.0}s, using fallback",
+            label,
+            dc,
+            DIRECT_SILENT_STRIKES,
+            DIRECT_PAUSE_SECS
+        );
+    }
 }
 
 /// _bridge_tcp_reencrypt: клиент <-> прямой TCP к DC.
@@ -1452,6 +1542,7 @@ pub async fn do_fallback<R, W>(
     dc: i32,
     is_test: bool,
     is_media: bool,
+    proto: u32,
     splitter: Option<MsgSplitter>,
     ctx: &CryptoCtx,
     cancel_token: CancellationToken,
@@ -1491,8 +1582,29 @@ where
         }
     }
 
-    // 2. Cloudflare proxy
+    // 2. Cloudflare proxy. Медиа — HTTP/2-транспортом (как в оригинале,
+    // пока CF отвечает по TLS), иначе и при неудаче — WebSocket /apiws.
     if use_cf {
+        if is_media && crate::cf_h2::h2_enabled() && cf_prefers_tls() {
+            if let Some(channel) = crate::cf_h2::H2.open(dc, label).await {
+                STATS.connections_h2.fetch_add(1, Ordering::Relaxed);
+                STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+                let ctx = ctx.fork();
+                crate::cf_h2::bridge(
+                    conn_read,
+                    conn_write,
+                    channel,
+                    proto,
+                    ctx.clt_dec,
+                    ctx.clt_enc,
+                    label.to_string(),
+                    dc,
+                    cancel_token,
+                )
+                .await;
+                return true;
+            }
+        }
         if let Some(ws) = cfproxy_acquire(label, dc, is_media).await {
             if ws.send_init(relay_init).await.is_ok() {
                 STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
@@ -1861,7 +1973,12 @@ async fn serve_core<R, W>(
         tg_dec: tg_decryptor,
     };
 
-    let pooled = pools.ws.get(dc, is_media, is_test);
+    let paused = direct_pause_remaining(dc);
+    let pooled = if paused.is_some() {
+        None
+    } else {
+        pools.ws.get(dc, is_media, is_test)
+    };
     let ws = match pooled {
         Some(ws) => {
             if ws.send_init(&relay_init).await.is_ok() {
@@ -1879,7 +1996,17 @@ async fn serve_core<R, W>(
     let ws = match ws {
         Some(ws) => ws,
         None => {
-            linfo!("[{}] DC{}{} WS pool unavailable -> fallback", label, dc, m_tag);
+            // Почему не прямой WS — чтобы по логу было видно, настроен ли он.
+            let why = if let Some(left) = paused {
+                format!("direct paused {:.0}s: no replies", left)
+            } else if resolve_configured_target(dc, is_media).is_none() {
+                "no direct route for this DC".to_string()
+            } else if pool_size() == 0 {
+                "pool disabled".to_string()
+            } else {
+                "pool empty".to_string()
+            };
+            linfo!("[{}] DC{}{} WS pool unavailable ({}) -> fallback", label, dc, m_tag, why);
             let splitter = MsgSplitter::new(proto);
             let ok = do_fallback(
                 pools,
@@ -1890,6 +2017,7 @@ async fn serve_core<R, W>(
                 dc,
                 is_test,
                 is_media,
+                proto,
                 splitter,
                 &ctx,
                 cancel_token,
@@ -1910,7 +2038,8 @@ async fn serve_core<R, W>(
     if splitter.is_some() {
         ldebug!("[{}] MsgSplitter activated for proto 0x{:08X}", label, proto);
     }
-    bridge_ws(conn_read, conn_write, ws, label, dc, is_media, splitter, ctx, cancel_token).await;
+    let stats = bridge_ws(conn_read, conn_write, ws, label.clone(), dc, is_media, splitter, ctx, cancel_token).await;
+    record_direct_session(&label, dc, &stats);
 }
 
 // ---------------------------------------------------------------------------
@@ -1955,6 +2084,10 @@ pub fn reset_route_state(pools: &ProxyPools, network_switched: bool) {
         reset_cf_dial_state();
         TRY_FRONTING_FIRST.store(false, Ordering::Relaxed);
         crate::cfproxy::clear_cfproxy_429_cooldowns();
+        crate::cf_h2::H2.reset();
+        reset_direct_health();
+    } else {
+        crate::cf_h2::H2.wake();
     }
 }
 
@@ -1981,6 +2114,9 @@ fn log_startup_banner(host: &str, port: u16, dc_opt_map: &HashMap<i32, String>) 
     if CFPROXY_ENABLED.load(Ordering::Relaxed) {
         let user = CFPROXY.read().user_domain.trim().to_string();
         linfo!("  CF proxy:      enabled ({})", if user.is_empty() { "auto".to_string() } else { user });
+    }
+    if crate::cf_h2::h2_enabled() {
+        linfo!("  CF H2 media:   enabled");
     }
     let workers = CF_WORKER_DOMAINS.read().clone();
     if !workers.is_empty() {
@@ -2338,6 +2474,25 @@ mod tests {
         drop(client_side);
         tokio::time::timeout(Duration::from_secs(10), bridge).await.expect("bridge ends").unwrap();
         server.abort();
+    }
+
+    #[test]
+    fn silent_direct_sessions_pause_the_route() {
+        let silent = SessionStats { up_bytes: 120, down_bytes: 0, secs: 10.0, stopped: false };
+        let healthy = SessionStats { up_bytes: 120, down_bytes: 900, secs: 10.0, stopped: false };
+        let stopped = SessionStats { up_bytes: 120, down_bytes: 0, secs: 10.0, stopped: true };
+        let quick = SessionStats { up_bytes: 120, down_bytes: 0, secs: 0.5, stopped: false };
+        let dc = 9001;
+        record_direct_session("t", dc, &silent);
+        record_direct_session("t", dc, &healthy);
+        record_direct_session("t", dc, &silent);
+        record_direct_session("t", dc, &stopped);
+        record_direct_session("t", dc, &quick);
+        assert!(direct_pause_remaining(dc).is_none(), "healthy session resets, stopped/quick ignored");
+        record_direct_session("t", dc, &silent);
+        let left = direct_pause_remaining(dc).expect("two silent sessions in a row pause the route");
+        assert!(left > DIRECT_PAUSE_SECS - 5.0);
+        DIRECT_HEALTH.lock().remove(&dc);
     }
 
     #[test]

@@ -41,6 +41,7 @@ class SettingsStore(private val context: Context) {
         val CUSTOM_CF_DOMAIN = stringPreferencesKey("custom_cf_domain")
         val CF_WORKER_DOMAINS = stringPreferencesKey("cf_worker_domains")
         val AUTO_START_ON_BOOT = booleanPreferencesKey("auto_start_on_boot")
+        val CF_H2_MEDIA = booleanPreferencesKey("cf_h2_media")
         val SECRET_KEY = stringPreferencesKey("secret_key")
         val LOG_SHOW_DEBUG = booleanPreferencesKey("log_show_debug")
         val LOG_SHOW_INFO = booleanPreferencesKey("log_show_info")
@@ -88,6 +89,7 @@ class SettingsStore(private val context: Context) {
     val customCfDomain: Flow<String> = context.dataStore.data.map { it[Keys.CUSTOM_CF_DOMAIN] ?: "" }
     val cfWorkerDomains: Flow<String> = context.dataStore.data.map { it[Keys.CF_WORKER_DOMAINS] ?: "" }
     val autoStartOnBoot: Flow<Boolean> = context.dataStore.data.map { it[Keys.AUTO_START_ON_BOOT] ?: false }
+    val cfH2Media: Flow<Boolean> = context.dataStore.data.map { it[Keys.CF_H2_MEDIA] ?: true }
     val secretKey: Flow<String> = context.dataStore.data.map { it[Keys.SECRET_KEY] ?: "" }
 
     val logShowDebug: Flow<Boolean> = context.dataStore.data.map { it[Keys.LOG_SHOW_DEBUG] ?: false }
@@ -156,6 +158,10 @@ class SettingsStore(private val context: Context) {
 
     suspend fun saveAutoStartOnBoot(enabled: Boolean) {
         context.dataStore.edit { it[Keys.AUTO_START_ON_BOOT] = enabled }
+    }
+
+    suspend fun saveCfH2Media(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.CF_H2_MEDIA] = enabled }
     }
 
     suspend fun saveUpdatePostpone(version: String, until: Long) {

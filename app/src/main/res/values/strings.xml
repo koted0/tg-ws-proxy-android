@@ -130,6 +130,8 @@
     <string name="cf_custom_domains">Own CF proxy domains</string>
     <string name="cf_custom_domains_hint">example.com, example2.com (empty = built-in list)</string>
     <string name="cf_worker_domains">Cloudflare Worker domains</string>
+    <string name="cf_h2_media">HTTP/2 for media</string>
+    <string name="cf_h2_media_hint">Photos and videos via Cloudflare use HTTP/2, as in the original. Turn off if media gets stuck.</string>
     <string name="cf_worker_domains_hint">name.username.workers.dev, … (comma-separated)</string>
     <string name="battery_optimization_banner">Android may put the proxy to sleep when the screen is locked. Tap to allow background work.</string>
 </resources>

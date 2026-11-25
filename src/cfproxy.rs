@@ -583,6 +583,16 @@ pub fn clear_cf_cooldowns(forget_mode: bool) {
     }
 }
 
+/// proxy/cf_websocket.py::cf_tls_in_cooldown — TLS-попытки к хосту
+/// kwsN.<домен> сейчас на паузе после таймаута.
+pub fn cf_tls_in_cooldown(host: &str) -> bool {
+    CF_CONN
+        .lock()
+        .timeout_until
+        .get(&(host.to_string(), true))
+        .is_some_and(|until| now_monotonic() < *until)
+}
+
 pub fn cf_prefers_tls() -> bool {
     let st = CF_CONN.lock();
     st.tls >= st.no_tls

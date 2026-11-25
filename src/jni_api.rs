@@ -160,6 +160,11 @@ pub extern "system" fn Java_com_amurcanov_tgwsproxy_NativeProxy_nativeSetProxyPr
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_amurcanov_tgwsproxy_NativeProxy_nativeSetCfH2Media(_env: *mut JniEnv, _class: JObject, v: JInt) {
+    guarded((), || crate::set_cf_h2_media(v != 0))
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_amurcanov_tgwsproxy_NativeProxy_nativeSetVerbose(_env: *mut JniEnv, _class: JObject, v: JInt) {
     guarded((), || crate::set_verbose(v != 0))
 }

@@ -1,4 +1,5 @@
 pub mod balancer;
+pub mod cf_h2;
 pub mod cfproxy;
 pub mod config;
 pub mod crypto;
@@ -153,6 +154,8 @@ pub fn stop_proxy() -> i32 {
     proxy::reset_tcp_backoff();
     proxy::reset_cf_dial_state();
     proxy::drop_active_sessions();
+    proxy::reset_direct_health();
+    cf_h2::H2.reset();
     linfo!("StopProxy: exit");
     0
 }
@@ -200,6 +203,11 @@ pub fn set_disable_secure(v: bool) {
 
 pub fn set_force_test_dc(v: bool) {
     FORCE_TEST_DC.store(v, Ordering::Relaxed);
+}
+
+/// HTTP/2-транспорт медиа через CF (`--no-h2` оригинала выключает).
+pub fn set_cf_h2_media(v: bool) {
+    CF_H2_MEDIA.store(v, Ordering::Relaxed);
 }
 
 pub fn set_proxy_protocol(v: bool) {

@@ -58,6 +58,7 @@ class ProxyService : Service() {
     private var lastCfDomain: String = ""
     private var lastSecretKey: String = ""
     private var lastCfWorkerDomains: String = ""
+    private var lastCfH2Media: Boolean = true
 
     companion object {
         const val ACTION_START = "com.amurcanov.tgwsproxy.START"
@@ -72,6 +73,7 @@ class ProxyService : Service() {
         const val EXTRA_CFPROXY_DOMAIN = "EXTRA_CFPROXY_DOMAIN"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
         const val EXTRA_CF_WORKER_DOMAINS = "EXTRA_CF_WORKER_DOMAINS"
+        const val EXTRA_CF_H2_MEDIA = "EXTRA_CF_H2_MEDIA"
         
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
@@ -112,7 +114,8 @@ class ProxyService : Service() {
                 val cfDomain = intent.getStringExtra(EXTRA_CFPROXY_DOMAIN) ?: ""
                 val secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: ""
                 val cfWorkerDomains = intent.getStringExtra(EXTRA_CF_WORKER_DOMAINS) ?: ""
-                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey, cfWorkerDomains)
+                val cfH2Media = intent.getBooleanExtra(EXTRA_CF_H2_MEDIA, true)
+                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey, cfWorkerDomains, cfH2Media)
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -125,7 +128,7 @@ class ProxyService : Service() {
                 // If we had saved params, try to restart
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
-                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey, lastCfWorkerDomains)
+                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey, lastCfWorkerDomains, lastCfH2Media)
                 } else {
                     stopSelf()
                 }
@@ -153,7 +156,7 @@ class ProxyService : Service() {
     private fun startProxy(bindIp: String, port: Int, ips: String, poolSize: Int = 4,
                            cfEnabled: Boolean = true, cfPriority: Boolean = true,
                            cfDomain: String = "", secretKey: String = "",
-                           cfWorkerDomains: String = "") {
+                           cfWorkerDomains: String = "", cfH2Media: Boolean = true) {
         if (_isRunning.value || stopInProgress) return
         _isVerifiedRunning.value = false
 
@@ -167,6 +170,7 @@ class ProxyService : Service() {
         lastCfDomain = cfDomain
         lastSecretKey = secretKey
         lastCfWorkerDomains = cfWorkerDomains
+        lastCfH2Media = cfH2Media
         notificationStartedAtMs = System.currentTimeMillis()
         lastNotificationContent = getString(R.string.notification_starting)
         lastNotificationAtMs = notificationStartedAtMs
@@ -203,6 +207,8 @@ class ProxyService : Service() {
                 NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
                 NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
                 NativeProxy.setCfWorkerDomains(cfWorkerDomains)
+                // Медиа через CF по HTTP/2, как в оригинале (выключатель — в настройках).
+                NativeProxy.setCfH2Media(cfH2Media)
                 // CF proxy/worker сами переключаются TLS(443) <-> HTTP(80) после таймаутов.
                 NativeProxy.setDisableSecure(false)
                 // DEBUG-строки ядра в интерфейсе не показываются — не тратим на них CPU.
@@ -316,7 +322,8 @@ class ProxyService : Service() {
                 cfPriority = lastCfPriority,
                 cfDomain = lastCfDomain,
                 secretKey = lastSecretKey,
-                cfWorkerDomains = lastCfWorkerDomains
+                cfWorkerDomains = lastCfWorkerDomains,
+                cfH2Media = lastCfH2Media
             )
         }
     }

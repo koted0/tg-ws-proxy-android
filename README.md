@@ -15,7 +15,17 @@
 
 ---
 
-## Что нового в 1.4.0
+## Что нового в 1.5.0
+
+**Нестабильная работа в режиме Cloudflare (медиа грузится бесконечно):**
+- Медиа через Cloudflare идёт по **HTTP/2**, как в оригинале (`cf_h2`). Фото, видео и файлы больше не тянутся через CF WebSocket, где большие ответы на Android обрывались (Flowseal/tg-ws-proxy#1655, #1695). Все медиа-соединения к DC идут мультиплексом в одном соединении с Cloudflare. Если сервер прислал только подтверждение, ответ забирается повтором последнего пакета: Telegram отбрасывает дубликаты. Ошибки транспорта Telegram (−404 и т.п.) доходят до клиента, и он сам пересоздаёт ключ.
+- Плановая ротация соединения Cloudflare (GOAWAY) не рвёт загрузки: начатые запросы дорабатывают, новые уходят в новое соединение. В оригинале GOAWAY закрывал все каналы (#1700).
+- Выключатель: **Настройки → CloudFlare CDN → HTTP/2 для медиа** (по умолчанию включён). Выключенный возвращает медиа на CF WebSocket.
+- В режиме «Авто (Включён CF)» DC2 и DC4 снова сначала пробуются напрямую через пул WebSocket, как в оригинале. Cloudflare остаётся запасным путём. Раньше в этом режиме прямые маршруты не задавались вовсе, и весь трафик, включая медиа, шёл через CF.
+- Страховка для прямого пути: если две сессии подряд к DC закрылись без единого байта ответа (прямой путь соединяется, но Telegram не отвечает), прямой путь к этому DC ставится на паузу на 5 минут. Трафик в это время идёт через Cloudflare.
+- В логе видно, почему соединение ушло в fallback: `WS pool unavailable (no direct route for this DC | pool empty | direct paused …)`. Маршрут медиа виден в строке `ROUTE DC4 media -> H2 lane=…`, итог — в `H2 session closed (…)`. В статистике новые счётчики `h2=` и `h2_err=`.
+
+## Что было в 1.4.0
 
 **Работа при заблокированном экране:**
 - Ядро знает о сети: пока её нет, провалы подключений не копятся в паузах маршрутов. При смене сети (Wi-Fi ⇄ LTE) старые сессии и пул закрываются, паузы сбрасываются. Раньше после выключенного экрана маршруты оставались «на паузе» до часа, и прокси не подключался.
@@ -40,7 +50,7 @@
 
 Ядро синхронизировано с оригиналом v1.12.0: пул WebSocket без прямых коннектов вне пула, CF proxy с переключением TLS ⇄ HTTP, cooldown CF Worker (429 — до 00:00 UTC), TCP fallback с backoff, Fake TLS с защитой от повторного ClientHello, исправлены баги порта (WS на голом порту 80, поломка Fake TLS-потока и др.).
 
-Не перенесено: **HTTP/2-мультиплексирование медиа через CF**. Медиа через CF идёт по обычному WebSocket `/apiws`, как в оригинале с `--no-h2`. Готовый ориентир для переноса — `cf_h2.rs` в [tg-ws-proxy-rs](https://github.com/valnesfjord/tg-ws-proxy-rs).
+HTTP/2-транспорт медиа через CF в 1.3.0 ещё не был перенесён: он появился в 1.5.0.
 
 ---
 
@@ -48,12 +58,12 @@
 
 ```text
 Telegram → 127.0.0.1:1443 (MTProto) → TG WS Proxy → WSS к kwsN.web.telegram.org
-                                                   ↘ fallback: CF Worker → CF proxy → TCP к DC
+                                                   ↘ fallback: CF Worker → CF proxy (медиа — HTTP/2) → TCP к DC
 ```
 
 1. Приложение поднимает локальный MTProto-прокси (нативное ядро на **Rust**).
 2. По 64-байтному handshake определяет датацентр и тип соединения (обычное/медиа).
-3. Берёт готовое WSS-соединение к датацентру из пула; если его нет — по очереди пробует Cloudflare Worker, CF proxy и прямой TCP.
+3. Берёт готовое WSS-соединение к датацентру из пула; если его нет — по очереди пробует Cloudflare Worker, CF proxy (медиа — по HTTP/2 к `/api`) и прямой TCP.
 
 ## Быстрый старт
 
@@ -66,6 +76,7 @@ Telegram → 127.0.0.1:1443 (MTProto) → TG WS Proxy → WSS к kwsN.web.telegr
 
 - **Свой Cloudflare Worker** — бесплатно, без покупки домена. Инструкция и код воркера: [CfWorker.md](https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/RU/CfWorker.md). Домен вида `name.username.workers.dev` впишите в **Настройки → Домены Cloudflare Worker** (можно несколько через запятую).
 - **Свой домен для CF proxy** — встроенные домены общие и могут упираться в лимиты Cloudflare. Инструкция: [CfProxy.md](https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/RU/CfProxy.md). Домен впишите в **Настройки → Свои домены CF proxy**.
+- **Медиа зависает в режиме CF** — выключите **Настройки → HTTP/2 для медиа**, проверьте ещё раз и приложите отчёт к issue с обоими вариантами.
 
 ### Прокси отваливается при заблокированном экране
 
@@ -97,7 +108,7 @@ cargo test --lib
 
 ### CI и релизы
 
-[`.github/workflows/android-build.yml`](.github/workflows/android-build.yml) на каждый push собирает ядро и три APK (`arm32`, `arm64`, `universal`). Push тега `v1.4.0` (или ручной запуск с `make_release`) публикует GitHub Release, и приложение предложит обновление.
+[`.github/workflows/android-build.yml`](.github/workflows/android-build.yml) на каждый push собирает ядро и три APK (`arm32`, `arm64`, `universal`). Push тега `v1.5.0` (или ручной запуск с `make_release`) публикует GitHub Release, и приложение предложит обновление.
 
 > [!IMPORTANT]
 > Без секретов `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` APK подписываются случайным debug-ключом раннера, и новую сборку нельзя поставить поверх старой. Для обновляемых релизов добавьте свой keystore в секреты репозитория.
@@ -112,7 +123,7 @@ cargo test --lib
 
 - [Flowseal](https://github.com/Flowseal/tg-ws-proxy) — оригинальный tg-ws-proxy, вся логика прокси.
 - [amurcanov](https://github.com/amurcanov) и контрибьюторы — Android-порт, интерфейс и Rust-ядро.
-- Идеи из форков: [pvtarget-glitch](https://github.com/pvtarget-glitch/tg-ws-proxy-android) (гонка CF-маршрутов, дробление ClientHello), [Alexingin](https://github.com/Alexingin/tg-ws-proxy-android) (отмена дозвона при уходе клиента), [artur0vi4/tunneljet](https://github.com/artur0vi4/tunneljet) (барьер паник, реакция на смену сети), [kamenwwcpp](https://github.com/kamenwwcpp/tg-ws-proxy-android), [valnesfjord/tg-ws-proxy-rs](https://github.com/valnesfjord/tg-ws-proxy-rs).
+- Идеи из форков: [pvtarget-glitch](https://github.com/pvtarget-glitch/tg-ws-proxy-android) (гонка CF-маршрутов, дробление ClientHello), [Alexingin](https://github.com/Alexingin/tg-ws-proxy-android) (отмена дозвона при уходе клиента), [artur0vi4/tunneljet](https://github.com/artur0vi4/tunneljet) (барьер паник, реакция на смену сети), [kamenwwcpp](https://github.com/kamenwwcpp/tg-ws-proxy-android), [valnesfjord/tg-ws-proxy-rs](https://github.com/valnesfjord/tg-ws-proxy-rs) (ориентир для HTTP/2-транспорта медиа, MIT).
 
 ## Лицензия
 

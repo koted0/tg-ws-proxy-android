@@ -152,6 +152,9 @@ impl Default for Cfproxy429State {
 
 // Cloudflare proxy config
 pub static CFPROXY_ENABLED: AtomicBool = AtomicBool::new(true);
+/// proxy/config.py::cfproxy_h2_media (`--no-h2` выключает): медиа через CF
+/// идёт HTTP/2-транспортом (src/cf_h2.rs), а не WebSocket.
+pub static CF_H2_MEDIA: AtomicBool = AtomicBool::new(true);
 
 pub struct CfproxyConfig {
     pub user_domain: String,
@@ -360,6 +363,8 @@ pub struct Stats {
     pub pool_misses: AtomicI64,
     pub cf_pool_hits: AtomicI64,
     pub cf_pool_misses: AtomicI64,
+    pub connections_h2: AtomicI64,
+    pub h2_errors: AtomicI64,
 }
 
 pub static STATS: Lazy<Stats> = Lazy::new(Stats::default);
@@ -383,12 +388,14 @@ impl Stats {
             "n/a".to_string()
         };
         format!(
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
+            "total={} active={} ws={} tcp_fb={} cf={} h2={} h2_err={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
             self.connections_tcp_fallback.load(Ordering::Relaxed),
             self.connections_cfproxy.load(Ordering::Relaxed),
+            self.connections_h2.load(Ordering::Relaxed),
+            self.h2_errors.load(Ordering::Relaxed),
             self.connections_fronting.load(Ordering::Relaxed),
             self.connections_bad.load(Ordering::Relaxed),
             self.connections_masked.load(Ordering::Relaxed),
@@ -444,6 +451,8 @@ impl Stats {
         self.pool_misses.store(0, Ordering::Relaxed);
         self.cf_pool_hits.store(0, Ordering::Relaxed);
         self.cf_pool_misses.store(0, Ordering::Relaxed);
+        self.connections_h2.store(0, Ordering::Relaxed);
+        self.h2_errors.store(0, Ordering::Relaxed);
     }
 }
 

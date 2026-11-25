@@ -140,6 +140,7 @@ fun InfoTab(settingsStore: SettingsStore) {
     val savedPort by settingsStore.port.collectAsStateWithLifecycle(initialValue = "1443")
     val savedPoolSize by settingsStore.poolSize.collectAsStateWithLifecycle(initialValue = 4)
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
+    val savedCfH2Media by settingsStore.cfH2Media.collectAsStateWithLifecycle(initialValue = true)
     val savedCustomCfDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
     val savedCustomCfDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
     val updateLatestVersion by settingsStore.updateLatestVersion.collectAsStateWithLifecycle(initialValue = "")
@@ -159,6 +160,7 @@ fun InfoTab(settingsStore: SettingsStore) {
         port = savedPort,
         poolSize = savedPoolSize,
         cfEnabled = savedCfEnabled,
+        cfH2Media = savedCfH2Media,
         customCfDomainEnabled = savedCustomCfDomainEnabled,
         customCfDomain = savedCustomCfDomain,
         logs = currentLogs,
@@ -1051,6 +1053,7 @@ private fun buildSupportReport(
     port: String,
     poolSize: Int,
     cfEnabled: Boolean,
+    cfH2Media: Boolean,
     customCfDomainEnabled: Boolean,
     customCfDomain: String,
     logs: List<LogEntry>,
@@ -1083,7 +1086,11 @@ private fun buildSupportReport(
     } else {
         "n/a"
     }
-    val mode = if (cfEnabled) "Cloudflare" else context.getString(R.string.report_mode_direct)
+    val mode = when {
+        !cfEnabled -> context.getString(R.string.report_mode_direct)
+        cfH2Media -> "Cloudflare (HTTP/2 media)"
+        else -> "Cloudflare (WS media)"
+    }
     val cfDomainLine = if (cfEnabled && customCfDomainEnabled && customCfDomain.isNotBlank()) {
         "\n${context.getString(R.string.report_cf_domain, customCfDomain.trim())}"
     } else {

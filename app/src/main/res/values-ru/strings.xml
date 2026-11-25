@@ -130,6 +130,8 @@
     <string name="cf_custom_domains">Свои домены CF proxy</string>
     <string name="cf_custom_domains_hint">example.com, example2.com (пусто — встроенный список)</string>
     <string name="cf_worker_domains">Домены Cloudflare Worker</string>
+    <string name="cf_h2_media">HTTP/2 для медиа</string>
+    <string name="cf_h2_media_hint">Фото и видео через Cloudflare идут по HTTP/2, как в оригинале. Выключите, если медиа зависает.</string>
     <string name="cf_worker_domains_hint">name.username.workers.dev, … (через запятую)</string>
     <string name="battery_optimization_banner">Android может усыплять прокси при заблокированном экране. Нажмите, чтобы разрешить работу в фоне.</string>
 </resources>

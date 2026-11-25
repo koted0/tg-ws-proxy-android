@@ -32,10 +32,18 @@ object ProxyController {
         val customCfDomainEnabled = settingsStore.customCfDomainEnabled.first()
         val customCfDomain = settingsStore.customCfDomain.first().trim()
         val cfWorkerDomains = settingsStore.cfWorkerDomains.first().trim()
+        val cfH2Media = settingsStore.cfH2Media.first()
         val secretKey = ensureSecretKey(settingsStore)
 
         val parsedIps = buildList {
-            if (!isDcAuto) {
+            if (isDcAuto) {
+                // Авто (CF): как в оригинале — DC2/DC4 сначала через прямой
+                // WebSocket из пула, Cloudflare остаётся запасным путём. Пул
+                // прогревается в фоне, так что заблокированный прямой путь
+                // клиенту ничего не стоит, а при рабочем трафик не идёт через CF.
+                appendDc(2, SettingsStore.DEFAULT_DIRECT_DC2_IP)
+                appendDc(4, SettingsStore.DEFAULT_DIRECT_DC4_IP)
+            } else {
                 appendDc(1, settingsStore.dc1.first())
                 appendDc(2, settingsStore.dc2.first())
                 appendDc(3, settingsStore.dc3.first())
@@ -69,6 +77,7 @@ object ProxyController {
                     if (customCfDomainEnabled && cfEnabled) customCfDomain else ""
                 )
                 putExtra(ProxyService.EXTRA_CF_WORKER_DOMAINS, cfWorkerDomains)
+                putExtra(ProxyService.EXTRA_CF_H2_MEDIA, cfH2Media)
                 putExtra(ProxyService.EXTRA_SECRET_KEY, secretKey)
             }
         )

@@ -35,6 +35,7 @@ object NativeProxy {
     @JvmStatic private external fun nativeSetForceTestDc(v: Int)
     @JvmStatic private external fun nativeSetProxyProtocol(v: Int)
     @JvmStatic private external fun nativeSetVerbose(v: Int)
+    @JvmStatic private external fun nativeSetCfH2Media(v: Int)
     @JvmStatic private external fun nativeSetNetworkAvailable(v: Int)
 
     fun setCfProxyConfig(enabled: Boolean, priority: Boolean, userDomain: String) =
@@ -48,6 +49,8 @@ object NativeProxy {
 
     /** DEBUG-логи ядра; переключается на лету, без перезапуска прокси. */
     fun setVerbose(v: Boolean) = nativeSetVerbose(if (v) 1 else 0)
+
+    fun setCfH2Media(v: Boolean) = nativeSetCfH2Media(if (v) 1 else 0)
 
     /** Есть ли сеть: пока её нет, ядро не записывает провалы в паузы маршрутов. */
     fun setNetworkAvailable(v: Boolean) = nativeSetNetworkAvailable(if (v) 1 else 0)

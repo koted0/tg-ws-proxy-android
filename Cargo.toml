@@ -1,6 +1,6 @@
 [package]
 name = "tgwsproxy"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 
 [workspace]
@@ -27,6 +27,10 @@ hex = "0.4"
 rand = "0.8"
 byteorder = "1"
 socket2 = { version = "0.5", features = ["all"] }
+# HTTP/2-транспорт медиа через Cloudflare (src/cf_h2.rs).
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
 # Корни Mozilla для проверки сертификатов GitHub/DoH (см. src/https.rs).
 webpki-roots = "1"

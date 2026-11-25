@@ -12,8 +12,8 @@ android {
     defaultConfig {
         applicationId = "com.amurcanov.tgwsproxy"
         targetSdk = 35
-        versionCode = 140
-        versionName = "1.4.0"
+        versionCode = 150
+        versionName = "1.5.0"
 
         // Откуда приложение проверяет обновления и куда ведут ссылки
         // "Репозиторий"/"Issues" в разделе "Информация".

@@ -1099,6 +1099,43 @@ pub async fn ws_connect_full_opts(
     ws_connect_once_full(&resolved, domain, path, remaining, sni, secure, dpi_split).await
 }
 
+/// TCP (IPv4 первым; при сломанном системном DNS — DoH, как в
+/// ws_connect_full_opts) и TLS с дроблением ClientHello по SNI. Для
+/// HTTP/2-транспорта медиа через Cloudflare (src/cf_h2.rs).
+pub(crate) async fn tls_connect_cf(
+    host: &str,
+    cfg: Arc<ClientConfig>,
+    dpi_split: bool,
+    timeout: Duration,
+) -> std::io::Result<TlsStream<DpiStream>> {
+    let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out");
+    let deadline = Instant::now() + timeout;
+    let tcp = match tokio::time::timeout_at(deadline, connect_tcp_ipv4_first(host, 443)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) if host.parse::<IpAddr>().is_err() => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let ip = match tokio::time::timeout(remaining, crate::cfproxy::resolve_doh(host)).await {
+                Ok(Some(ip)) if !ip.is_empty() && ip != host => ip,
+                _ => return Err(e),
+            };
+            ldebug!("H2 {}: system DNS failed, retry via DoH -> {}", host, ip);
+            tokio::time::timeout_at(deadline, connect_tcp_ipv4_first(&ip, 443))
+                .await
+                .map_err(|_| timed_out())??
+        }
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(timed_out()),
+    };
+    set_sock_opts(&tcp);
+    let stream = DpiStream::new(
+        tcp,
+        if dpi_split { SplitMode::TlsSni(host.as_bytes().to_vec()) } else { SplitMode::Off },
+    );
+    tokio::time::timeout_at(deadline, TlsConnector::from(cfg).connect(server_name(host), stream))
+        .await
+        .map_err(|_| timed_out())?
+}
+
 /// WS поверх уже подключённого plain-TCP (тесты и отладка без 80/443).
 pub async fn ws_upgrade_plain(conn: TcpStream, domain: &str, path: &str, timeout: Duration) -> Result<RawWebSocket, WsError> {
     let probe = socket2::SockRef::from(&conn).try_clone().ok();
